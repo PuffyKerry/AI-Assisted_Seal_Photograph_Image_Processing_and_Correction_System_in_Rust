@@ -1,0 +1,6 @@
+[workspace]
+resolver = "2"
+members = [
+    "AI-Model",
+    "IP_functions",
+]
