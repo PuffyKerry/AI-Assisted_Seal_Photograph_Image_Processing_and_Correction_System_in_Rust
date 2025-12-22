@@ -1,4 +1,4 @@
-Status as of 12/17: DCP fleshed out and testing of it started. Linear Regression added, not tested yet.  
+Status as of 12/22: DCP-based dehazing fully fleshed out, can be made a bit more modular/flexible/efficient. Moving on to ML stuff now, hope it goes well (top ten words before disaster: "I hope it goes well") 
 TODO:  
   - Improve formatting of README and documentation in general.  
   - IMPROVE FILE STRUCTURE ASAP, I really need to make it more understandable.  
@@ -13,12 +13,13 @@ Dataset is here: https://etsin.fairdata.fi/dataset/22b5191e-f24b-4457-93d3-95797
 Image Processing:  
   - Dark Channel Prior is implemented for haze detection. Specifics are explained in comments and in the project plan.  
     - To run test: cargo run -p ai-model  
-      - This is currently a very temporary test, hence it being run in the ai-model crate.  
+      - This is currently a still-somewhat-temporary test, hence it being run in the ai-model crate.  
+    - DCP-based dehazing is now implemented (12/21). Works rather well.
   - TODO:  
     - Other functions still need to be implemented, especially for dehazing, contrast adjustment, and glare reduction.
-    - Reorganize code and file structure  
+    - Reorganize code and file structure, some more
   
 Machine Learning:  
   - Linear Regression is implemented, but not tested yet.
     - To run: not possible yet. Needs testing first.
-  - TODO: training testing of model. Refinement based on dataset.  
+  - TODO: training testing of model. Refinement based on dataset. High priority
