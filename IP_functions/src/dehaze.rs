@@ -57,6 +57,7 @@ pub fn dehaze_static_test(img_3d: &Array3<f32>, patch_size: usize) -> Array3<f32
     println!("atmospheric light length: {}", atmospheric.len());
     let transmission = estimated_transmission_map(img_3d, &atmospheric, patch_size, OMEGA); //raw transmission map
     println!("transmission map length: {}", transmission.len());
+    println!("transmission range: min={}, max={}, numbers near 1.0 = no haze, near 0.0 = much haze", transmission.iter().cloned().fold(f32::INFINITY, f32::min), transmission.iter().cloned().fold(f32::NEG_INFINITY, f32::max));
     let grayscale = rgb_to_grayscale(img_3d); //refine transmission using guided filter to remove halos produced by DCP's use of patches
     println!("grayscale length: {}", grayscale.len());
     let refined_transmission = guided_filter(&grayscale, &transmission, GUIDED_RADIUS, GUIDED_EPS);
@@ -64,6 +65,26 @@ pub fn dehaze_static_test(img_3d: &Array3<f32>, patch_size: usize) -> Array3<f32
     recover_scene_radiance(img_3d, &refined_transmission, &atmospheric, T0) //recover scene radiance from refined transmission map
 }
 
+pub fn dehaze_default_parameters_test(img_3d: &Array3<f32>, patch_size: usize) -> Array3<f32> { //algorithm parameters based on He et al. paper defaults exactly as specified in the paper as a baseline
+    const OMEGA: f32 = 0.95;          //haze retention factor, keeps 25% haze for realism
+    const T0: f32 = 0.1;              //minimum transmission to prevent noise in thick haze
+    const TOP_PERCENT: f32 = 0.001;   //top 0.1% brightest pixels for atmospheric light estimation
+    const GUIDED_RADIUS: usize = 60;  //guided filter window radius
+    const GUIDED_EPS: f32 = 0.0001;   //guided filter regularization (smaller = sharper edges)
+
+    let dark_channel = find_dark_channel(img_3d, patch_size); //detect haze with DCP
+    println!("dark channel length: {}", dark_channel.len());
+    let atmospheric = estimate_atmospheric_light(img_3d, &dark_channel, TOP_PERCENT); //use pixels who have the brightest dark channels to estimate the color of atmospheric light, aka the haze
+    println!("atmospheric light length: {}", atmospheric.len());
+    let transmission = estimated_transmission_map(img_3d, &atmospheric, patch_size, OMEGA); //raw transmission map
+    println!("transmission map length: {}", transmission.len());
+    println!("transmission range: min={}, max={}, numbers near 1.0 = no haze, near 0.0 = much haze", transmission.iter().cloned().fold(f32::INFINITY, f32::min), transmission.iter().cloned().fold(f32::NEG_INFINITY, f32::max));
+    let grayscale = rgb_to_grayscale(img_3d); //refine transmission using guided filter to remove halos produced by DCP's use of patches
+    println!("grayscale length: {}", grayscale.len());
+    let refined_transmission = guided_filter(&grayscale, &transmission, GUIDED_RADIUS, GUIDED_EPS);
+    println!("refined transmission length: {}", refined_transmission.len());
+    recover_scene_radiance(img_3d, &refined_transmission, &atmospheric, T0) //recover scene radiance from refined transmission map
+}
 
 /*
 EXTREMELY. WIP. Same as dehaze_static_test, but now with custom parameters for fine-tuning results by overriding any or all algorithm parameters for experimentation or specific use cases in production

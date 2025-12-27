@@ -1,1 +1,14 @@
 /target
+
+# Dataset - too large for GitHub (~2GB)
+# See README.md for setup instructions
+/dataset/
+/SealID/
+
+# Output images from testing
+output_*.jpg
+output_*.png
+
+# IDE files
+.idea/
+*.iml

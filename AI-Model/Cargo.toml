@@ -7,3 +7,4 @@ edition = "2021"
 ndarray = "0.17.1"
 image = "0.25.9"
 IP_functions = { path = "../IP_functions" }
+rand = "0.10.0-rc.5"

@@ -1,8 +1,13 @@
 //Simple Linear Regression implementation in Rust
-//TODO: testing of this entire module
-//not going to test this yet before the IP portion of this iteration
+//module now tested, could have some more testing for edge cases
+//Works relatively well so far.
 
-use ndarray::{Array1, Array2, Axis};
+///Q: Why Linear Regression?
+///A: As mentioned in the Project Plan and elsewhere, linear regression, besides being low-risk, also has the advantage of working well with continuous data such as mean Dark Channel.
+
+//TODO: further testing if necessary, extension to more variables, etc.
+
+use ndarray::{Array1, Array2};
 
 pub struct LinearRegression {
     pub weights: Array1<f64>,
@@ -17,7 +22,7 @@ impl LinearRegression {
         }
     }
 
-    //Predict output given input matrix and current weights/biases of model
+    //Predict output given input matrix and current weights/biases of model, simple y = mx + b implementation
     pub fn predict(&self, features: &Array2<f64>) -> Array1<f64> {
         features.dot(&self.weights) + self.bias
     }
