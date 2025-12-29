@@ -120,7 +120,7 @@ fn run_single_image_tests(img_path: &str) { //ai helped write more tests for me 
 
     println!("Saved result to {}", output_custom);
 
-    //Test 3: Static test parameters (He et al. with some modifications for clarity)
+    //Test 3: Static test parameters (He et al. with some modifications for clarity)f
     println!("\n--- Test 3: Static Test Parameters (Modified He et al.) ---");
     println!("Dehazing IP pipeline test: Dark Channel Prior-based dehazing with dehaze_static_test");
     println!("Parameters: omega=0.75, t0=0.25, guided_radius=15 (other params are He et al. defaults)");

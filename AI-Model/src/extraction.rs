@@ -50,3 +50,8 @@ pub fn extract_all_features(img_3d: &Array3<f32>, patch_size: usize) -> Array1<f
         feature_low_transmission_ratio(&transmission, 0.5),
     ])
 }
+
+//Realized that extraction often didn't need more than the mean dark channel value, more optimal.
+pub fn extract_mean_dark_channel(img_3d: &Array3<f32>, patch_size: usize) -> f64 {
+    feature_mean_dark_channel(&find_dark_channel(img_3d, patch_size))
+}

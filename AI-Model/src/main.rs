@@ -8,15 +8,19 @@ mod training;
 mod ip_tests;
 
 use std::env;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::fs;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use image::{GrayImage, Luma};
 use ndarray::{Array2, Array3};
 use IP_functions::dehaze::{dehaze_default_parameters_test, dehaze_with_params};
 use rand::seq::SliceRandom;
 use rand::rng;
-use crate::training::{train_haze_regressor, classify_haze_with_score, evaluate_accuracy, predict_haze_score}; //last two were in use before I realized evaluate_accuracy was unnecessary and put predict_haze_score in several other functions, keeping for reference 
+use memmap2::Mmap;
+use rayon::prelude::*;
+use crate::training::{train_haze_regressor, train_haze_regressor_precomputed};
 use crate::ip_tests::{image_to_array3, array3_to_image, run_all_ip_tests};
+use crate::extraction::extract_mean_dark_channel;
 
 //CLI flags handling was fully AI-generated, did check over it. Rather simple/similar to C++, so I determined there wasn't really a reason I should do it manually from a learning perspective.
 fn main() {
@@ -89,7 +93,7 @@ fn print_help() { //Ai-generated to save time. Checked for accuracy.
 }
 
 //Run ML demo on a few test images
-//AI-generated as a truncated version of the full training demo, meant to show that the ML model can be trained and that the IP engine works without spending time/resources on training an actual model.
+//AI-generated as a truncated version of the full training demo, meant to show that the ML model can be trained and that the IP engine works without spending time/resources on training with the full dataset.
 fn run_ml_demo() {
     println!("=== AI-Assisted Seal Photograph Image Processing System ===");
     println!("=== ML Training Demo ===\n");
@@ -105,11 +109,11 @@ fn run_ml_demo() {
         println!("Attempting to load: {}", path);
         match image::open(path) {
             Ok(img) => {
-                let img_matrix = image_to_array3(&img);
+                let img_matrix = image_to_array3(&img); //keeping the old, inefficient, but very step-by-step code that relied on directly calling image_to_array3 here in the demo as it is only 2 images
 
                 //Estimate haze level using DCP features as a proxy (same as full dataset training)
-                let features = crate::extraction::extract_all_features(&img_matrix, 15);
-                let estimated_haze = features[0].clamp(0.0, 1.0); //mean dark channel as proxy for haze
+                let mean = extract_mean_dark_channel(&img_matrix, 15);
+                let estimated_haze = mean.clamp(0.0, 1.0); //mean dark channel as proxy for haze
 
                 images.push(img_matrix);
                 labels.push(estimated_haze);
@@ -138,7 +142,7 @@ fn run_ml_demo() {
     let regressor = train_haze_regressor(&images, &labels, patch_size, learning_rate, epochs);
 
     println!("\n=== Evaluating Trained Model ===");
-    let mse = crate::training::evaluate_mse(&regressor, &images, &labels, patch_size);
+    let mse = training::evaluate_mse(&regressor, &images, &labels, patch_size);
     println!("\nTraining set MSE: {:.4}", mse);
 
     println!("\n=== Running Dehazing Pipeline ===");
@@ -178,37 +182,13 @@ fn run_full_dataset_training() { //I/O code was AI generated, flow was mine
         println!("Error: No images found in {:?}", dataset_path);
         return;
     }
-
     println!("Found {} images in dataset", image_paths.len());
 
-    let mut images: Vec<Array3<f32>> = Vec::new();
-    let mut labels: Vec<f64> = Vec::new();
-
-    let max_images = images.len();
-    let mut loaded = 0;
-    println!("Loading images (max {} for demo)...", max_images);
-
-    for path in image_paths.iter().take(max_images) {
-        match image::open(path) {
-            Ok(img) => {
-                let img_matrix = image_to_array3(&img);
-
-                let features = crate::extraction::extract_all_features(&img_matrix, 15); //Estimate haze level using DCP features as a proxy, chosen over manually labelling
-                let estimated_haze = features[0]; //mean dark channel used as the proxy for haze
-
-                images.push(img_matrix);
-                labels.push(estimated_haze.clamp(0.0, 1.0));
-
-                loaded += 1;
-                if loaded % 5 == 0 {
-                    println!("  Loaded {}/{} images...", loaded, max_images.min(image_paths.len()));
-                }
-            }
-            Err(e) => {
-                println!("  Warning: Failed to load {:?}: {}", path, e);
-            }
-        }
-    }
+    //Load images with precomputed features in one parallel pass - optimization to avoid computing DCP twice
+    let patch_size = 15;
+    println!("Loading images and extracting features in parallel...");
+    let (images, labels, features) = load_images_with_features(&image_paths, patch_size);
+    println!("Successfully loaded {} images with precomputed features", images.len());
 
     if images.len() < 2 {
         println!("Error: Need at least 2 images to train");
@@ -217,11 +197,11 @@ fn run_full_dataset_training() { //I/O code was AI generated, flow was mine
 
     println!("\n=== Training on {} images ===", images.len());
 
-    let patch_size = 15;
     let learning_rate = 0.01; //smaller learning rate for larger dataset for efficiency
-    let epochs = 100; //less epochs than optimal due to dataset size making training rather slow
+    let epochs = 200; //less epochs than optimal due to dataset size making training rather slow
 
-    let regressor = train_haze_regressor(&images, &labels, patch_size, learning_rate, epochs);
+    //Use precomputed features to skip feature extraction during training
+    let regressor = train_haze_regressor_precomputed(&features, &labels, learning_rate, epochs);
 
     println!("\n=== Training Complete ===");
     println!("Model weights: {:?}", regressor.model.weights);
@@ -242,21 +222,14 @@ fn run_full_dataset_training() { //I/O code was AI generated, flow was mine
     }
 
     //Load query images
-    let mut test_images: Vec<Array3<f32>> = Vec::new();
-    let mut test_labels: Vec<f64> = Vec::new();
-
-    for path in &query_images {
-        if let Ok(img) = image::open(path) {
-            let img_matrix = image_to_array3(&img);
-            let features = crate::extraction::extract_all_features(&img_matrix, 15);
-            test_labels.push(features[0].clamp(0.0, 1.0)); //same heuristic as training
-            test_images.push(img_matrix);
-            println!("Loaded: {}", path.file_name().unwrap_or_default().to_string_lossy());
-        }
+    let test_images = load_images_parallel(&query_images);
+    for cur_path in &query_images {
+        println!("Loaded: {}", cur_path.file_name().unwrap_or_default().to_string_lossy());
     }
+    let test_labels: Vec<f64> = test_images.iter().map(|img| extract_mean_dark_channel(img, patch_size).clamp(0.0, 1.0)).collect();
 
     if !test_images.is_empty() {
-        let mse = crate::training::evaluate_mse(&regressor, &test_images, &test_labels, patch_size);
+        let mse = training::evaluate_mse(&regressor, &test_images, &test_labels, patch_size);
         println!("\nQuery set MSE: {:.4}", mse);
     }
 }
@@ -332,7 +305,7 @@ fn dehaze_with_custom_params(img_path: &str, omega: f32, t0: f32, patch_size: us
 }
 
 //Find all image files recursively in a directory
-fn find_images_in_directory(dir: &Path) -> Vec<std::path::PathBuf> { //this was AI, I learned recursion in high school. Also not in use as of now as the model is trained off of only a single directory with no directories inside it.
+fn find_images_in_directory(dir: &Path) -> Vec<PathBuf> { //this was AI, I learned recursion in high school. Also not in use as of now as the model is trained off of only a single directory with no directories inside it.
     let mut images = Vec::new();
 
     if let Ok(entries) = fs::read_dir(dir) {
@@ -352,12 +325,84 @@ fn find_images_in_directory(dir: &Path) -> Vec<std::path::PathBuf> { //this was 
     images
 }
 
-//fast function for getting a few random images from a directory, for example queries. 
-fn find_random_x_images_in_directory(dir: &Path, num: usize) -> Vec<std::path::PathBuf> {
+//fast function for getting a few random images from a directory, for example queries.
+fn find_random_x_images_in_directory(dir: &Path, num: usize) -> Vec<PathBuf> {
     let mut images = find_images_in_directory(dir);
     let mut rng = rng();
     images.shuffle(&mut rng);
     images.into_iter().take(num).collect()
+}
+
+//Load downsized images in parallel and prints current progress using memory-mapped files for faster I/O, as image_to_array3() was slow due to being single-core and would store repeated copies of already loaded images in memory.
+//@param: paths: array of paths to image files passed from main()
+//@return: vector of 3D arrays from image_to_array3()
+fn load_images_parallel(paths: &[PathBuf]) -> Vec<Array3<f32>> {
+    let counter = AtomicUsize::new(0);
+    let total = paths.len();
+
+    paths.par_iter().filter_map(|path| {
+        let file = fs::File::open(path).ok()?; //memory mapping to avoid redundant loading - optimization
+        let mmap = unsafe { //fine as long as file path is checked beforehand
+            Mmap::map(&file).ok()?
+        };
+
+        let img = image::load_from_memory(&mmap).ok()?; //extract from memory map buffer to load image
+        let resized_img = img.resize((img.width() / 4).max(1), (img.height() / 4).max(1), image::imageops::FilterType::CatmullRom); //downsample for faster processing as images are large, truncated ints are fine as the error is very small
+        let img_matrix = image_to_array3(&resized_img); //yes, this is literally just a neat wrapper around image_to_array3, but it avoids redundant loading and speeds up I/O significantly for large datasets.
+
+        let curcount = counter.fetch_add(1, Ordering::Relaxed) + 1; //needed to use an atomic counter to minimize race conditions
+        if curcount % 5 == 0 || curcount == total {
+            println!("Loaded {}/{} images...", curcount, total);
+        }
+
+        Some(img_matrix)
+    }).collect()
+}
+
+//Load images in parallel with precomputed features and labels - optimization to avoid computing DCP features twice
+//Computes extract_all_features() during loading so we don't need to recompute during training
+//@param: paths: array of paths to image files
+//@param: patch_size: patch size for DCP feature extraction
+//@return: tuple of (images, labels, feature_matrix) where feature_matrix is [num_images x 5]
+fn load_images_with_features(paths: &[PathBuf], patch_size: usize) -> (Vec<Array3<f32>>, Vec<f64>, Array2<f64>) {
+    let counter = AtomicUsize::new(0);
+    let total = paths.len();
+
+    //parallel load images and extract features in one pass
+    let results: Vec<_> = paths.par_iter().filter_map(|path| {
+        let file = fs::File::open(path).ok()?;
+        let mmap = unsafe { Mmap::map(&file).ok()? };
+
+        let img = image::load_from_memory(&mmap).ok()?;
+        let img_matrix = image_to_array3(&img);
+
+        //extract all features during loading to avoid recomputing in training
+        let features = extraction::extract_all_features(&img_matrix, patch_size);
+        let label = features[0].clamp(0.0, 1.0); //mean_dark_channel is features[0]
+
+        let curcount = counter.fetch_add(1, Ordering::Relaxed) + 1;
+        if curcount % 5 == 0 || curcount == total {
+            println!("Processed {}/{} images...", curcount, total);
+        }
+
+        Some((img_matrix, label, features))
+    }).collect();
+
+    //unzip results and build feature matrix
+    let num_samples = results.len();
+    let mut feature_matrix = Array2::<f64>::zeros((num_samples, 5));
+    let mut images = Vec::with_capacity(num_samples);
+    let mut labels = Vec::with_capacity(num_samples);
+
+    for (i, (img, label, feat)) in results.into_iter().enumerate() {
+        for j in 0..5 {
+            feature_matrix[[i, j]] = feat[j];
+        }
+        images.push(img);
+        labels.push(label);
+    }
+
+    (images, labels, feature_matrix)
 }
 
 //convert matrix of calculated dark channel ratios to grayscale image representing haze levels. May move to other module.

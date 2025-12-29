@@ -8,3 +8,5 @@ ndarray = "0.17.1"
 image = "0.25.9"
 IP_functions = { path = "../IP_functions" }
 rand = "0.9"
+memmap2 = "0.9.9"
+rayon = "1.11.0"

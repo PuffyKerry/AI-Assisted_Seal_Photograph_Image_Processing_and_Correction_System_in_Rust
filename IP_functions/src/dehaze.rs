@@ -10,7 +10,7 @@ use crate::radiance::recover_scene_radiance;
 use crate::guided_filter::{guided_filter, rgb_to_grayscale};
 
 /*
-Single function for the broad dehazing functionality specified in the Project Plan that combines all the steps needed: dark channel prior calculation (detect haze), atmospheric light color estimation (calculate what light values the haze shifted), transmission map estimation (map out what changes to make to each pixel), refinement → radiance recovery
+Single function for the broad dehazing functionality specified in the Project Plan that combines all the steps needed: dark channel prior calculation (detect haze), atmospheric light color estimation (calculate what light values the haze shifted), transmission map estimation (map out what changes to make to each pixel), refinement (keep edges of objects sharp), radiance recovery (apply the changes).
 
 Purpose: Single entry point for dehazing functionality of the broader IP module
     Calls each component in sequence to handle control flow with sensible default parameters based on the original He et al. paper

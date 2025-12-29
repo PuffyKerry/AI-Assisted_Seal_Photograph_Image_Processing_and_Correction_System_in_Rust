@@ -76,8 +76,40 @@ pub fn train_haze_regressor(images: &[ndarray::Array3<f32>], labels: &[f64], pat
 }
 
 /*
+Train a linear regression model using precomputed features - avoids recomputing DCP features if already extracted during loading
+This is an optimization for large datasets where feature extraction is expensive
+AI-assisted as it build off of previous working code.
+
+@param: features: precomputed feature matrix [samples x 5] from extract_all_features()
+@param: labels: haze labels for each image (0.0 = clear, 1.0 = heavy haze)
+@param: learning_rate: gradient descent step size (typically 0.01)
+@param: epochs: number of training iterations (typically 100-500)
+@return: trained HazeRegressor with normalization parameters
+*/
+pub fn train_haze_regressor_precomputed(features: &Array2<f64>, labels: &[f64], learning_rate: f64, epochs: usize) -> HazeRegressor {
+    assert_eq!(features.nrows(), labels.len(), "Number of feature rows must match number of labels");
+    assert!(!labels.is_empty(), "Must provide at least one training sample");
+
+    let num_features = features.ncols();
+    println!("Training with {} precomputed feature vectors...", labels.len());
+
+    let (normalized_features, feature_mins, feature_ranges) = normalize_features_with_params(features);
+    let targets = Array1::from_vec(labels.to_vec());
+
+    println!("Training linear regression model...");
+    let mut model = LinearRegression::new(num_features);
+    model.train(&normalized_features, &targets, learning_rate, epochs);
+
+    println!("Training complete!");
+    HazeRegressor {
+        model,
+        feature_mins,
+        feature_ranges,
+    }
+}
+
+/*
 Normalize features using min-max scaling to [0, 1] range
-Returns the normalized features along with min and range values for each feature
 Purpose: Prevents features with larger magnitudes from dominating gradient updates
 
 @param: features: raw feature matrix [samples x features]
