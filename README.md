@@ -1,12 +1,12 @@
 # AI-Assisted Seal Photograph Image Processing and Correction System
 
 Note: much of the README was AI-generated based on my comments in the code.
-Status as of 12/26: Linear regression haze regressor implemented, CLI with custom dehazing parameters added. Demos added. 
-- Summary of research slightly delayed due to most of the summary contents being in various places ranging from code comments to emails to the Project Plan. As rationale for each decision is well-documented in each place where the decision's results were implemented, I believe the summary can wait another day, and also due to not having factored in a couple days of delay due to Christmas Eve and Christmas Day.
+Status as of 12/28: Optimization changes to improve performance of 12/26 changes: Linear regression haze regressor implemented, CLI with custom dehazing parameters added. Demos added. 
+- Summary of research collated and turned in. 
 
 TODO:  
   - Improve formatting of README and documentation in general.  
-  - IMPROVE FILE STRUCTURE ASAP, I really need to make it more understandable.  
+  - Make more improvements to organization if possible.   
 
 ## Dataset Setup
 
