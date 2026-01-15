@@ -129,3 +129,16 @@ cargo test -p IP_functions
     - Full dataset training and evaluation
     - Model persistence (save/load trained models)
     - Manual query feature (short wrapper for a function call, minor feature) separate from regressor
+  - Papers and Documentation Referenced:
+    - burn documentation: https://docs.rs/burn/latest/burn/
+      - burn was used due to its flexibility, efficiency, safety/robustness, and wide backend support.
+      - This crate does not give prebuilt models or training pipelines, but it does provide a lot of the building blocks like tensors and backend support. 
+    - Understanding CNN's better: (very helpful in combination with rust crate documentation)
+      - https://www.geeksforgeeks.org/deep-learning/kernels-filters-in-convolutional-neural-network/
+      - https://www.geeksforgeeks.org/machine-learning/activation-functions-neural-networks/
+      - https://www.geeksforgeeks.org/deep-learning/cnn-introduction-to-pooling-layer/
+      - https://www.geeksforgeeks.org/deep-learning/relu-activation-function-in-deep-learning/
+      - https://optimization.cbe.cornell.edu/index.php?title=Adam
+    - Papers on prior use of CNN's for haze detection and DCP-based dehazing (both accessed via ASU Library):
+      - Wu, J., Liu, Z., Huang, F. et al. Adaptive haze pixel intensity perception transformer structure for image dehazing networks. Sci Rep 14, 22435 (2024). https://doi.org/10.1038/s41598-024-73866-y
+      - Fazlali, H., Shirani, S., McDonald, M. et al. Cloud/haze detection in airborne videos using a convolutional neural network. Multimed Tools Appl 79, 28587–28601 (2020). https://doi.org/10.1007/s11042-020-09359-7
