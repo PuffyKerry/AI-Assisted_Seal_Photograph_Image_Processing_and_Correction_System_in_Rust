@@ -1,16 +1,17 @@
 # AI-Assisted Seal Photograph Image Processing and Correction System
 
 Note: much of the README was AI-generated based on my comments in the code.
-Status as of 12/28: Optimization changes to improve performance of 12/26 changes: Linear regression haze regressor implemented, CLI with custom dehazing parameters added. Demos added. 
-- Summary of research collated and turned in. 
+Status as of 1/14: First HEAVILY WIP version of Iteration 2. CNN for haze detection is implemented, pipeline is mostly working, but needs a lot of cleanup, SIGNIFICANTLY more testing, more documentation, a faster machine for testing/developmen, and perhaps some more/less layers in the architecture depending on further testing.
 
 TODO:  
+  - Flesh out Iteration 2 CNN
+  - Add more IP functions (contrast adjustment, glare reduction) if possible
   - Improve formatting of README and documentation in general.  
   - Make more improvements to organization if possible.   
 
 ## Dataset Setup
 
-The SealID dataset (~2GB, 2000+ images) is required for training but is too large for GitHub.
+The SealID dataset (~2GB, 2000+ images) is required for training but is too large for GitHub. Reasons for using this dataset were outlined in the project plan. This dataset is being used for Iteration 2 of the project for comparison purposes.
 
 **Dataset Source:** https://etsin.fairdata.fi/dataset/22b5191e-f24b-4457-93d3-95797c900fc0
 - Credit goes to researchers as mentioned:
@@ -59,14 +60,19 @@ The SealID dataset (~2GB, 2000+ images) is required for training but is too larg
 ### Command Line Options
 
 ```bash
-# Run ML training demo (default)
+# Run Linear Regression Regressor training demo (default)
 cargo run -p ai-model
 
 # Run IP engine tests (dehazing on test images)
 cargo run -p ai-model -- --ip-tests
 
-# Train on full dataset (requires dataset setup)
+# Train Regressor on full dataset (requires dataset setup)
 cargo run -p ai-model -- --train-full
+
+# Run Convolutional Neural Network demo (only option for now)
+cargo run -p ai-model -- --demo-cnn
+
+# Running CNN on full dataset IS NOT IMPLEMENTED YET. DO NOT TRY IT. WILL BE IMPLEMENTED LATER IN ITERATION 2. 
 
 # Dehaze a specific image with default parameters
 cargo run -p ai-model -- --dehaze path/to/image.jpg
@@ -102,10 +108,24 @@ cargo test -p IP_functions
 
 ## Machine Learning
 
-- Linear Regression implemented as a **haze regressor** (outputs continuous haze score 0.0-1.0)
-  - Uses DCP-derived features: mean dark channel, transmission stats, atmospheric intensity
+- Iteration 1: Linear Regression implemented as a **haze regressor** (outputs continuous haze score 0.0-1.0)
+  - Uses DCP-derived features: mean dark channel, transmission stats (WIP), atmospheric intensity (WIP)
   - Can be thresholded for classification (>0.5 = "High Haze", <=0.5 = "Low Haze")
-- TODO: 
-  - Full dataset training and evaluation
-  - Model persistence (save/load trained models)
-  - Manual query feature (short wrapper for a function call, minor feature)
+  - TODO: (nice-to-haves)
+    - Model persistence (save/load trained models)
+    - Manual query feature (short wrapper for a function call, minor feature)
+
+- Iteration 2 (WIP): Convolutional Neural Network implemented as a **haze predictor** (outputs predicted haze score) that **accepts variable image sizes** with a placeholder for DCP parameter recommendations.
+  - Architecture: 4 convolutional layers with strided downsampling → Global Average Pooling→ Fully Connected layers -> Sigmoid Function to normalize haze output to [0,1]
+  - Uses DCP-derived features: mean dark channel, transmission stats (WIP), atmospheric intensity (WIP)
+  - Also trained on SealID dataset for comparison purposes.
+  - Handles variable input image sizes using Global Average Pooling
+  - STATUS: VERY WIP DUE TO LITTLE TESTING AND DATASET SIZE. NOT READY FOR USE. MAY ADJUST ARCHITECTURE BASED ON FURTHER TESTING.
+  - TODO: 
+    - SIGNIFICANT TESTING
+      - Architecture adjustments based on testing results
+    - Optimization for lower-end devices
+    - Robustness and organization changes due to AI-generated code in some medium-importance functions (detailed in CNN implementation)
+    - Full dataset training and evaluation
+    - Model persistence (save/load trained models)
+    - Manual query feature (short wrapper for a function call, minor feature) separate from regressor

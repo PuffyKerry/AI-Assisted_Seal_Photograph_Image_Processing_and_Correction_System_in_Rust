@@ -10,3 +10,7 @@ IP_functions = { path = "../IP_functions" }
 rand = "0.9"
 memmap2 = "0.9.9"
 rayon = "1.11.0"
+
+# Burn ML framework for CNN - Iteration 2
+burn = { version = "0.16", features = ["train", "ndarray"] }
+burn-ndarray = "0.16"

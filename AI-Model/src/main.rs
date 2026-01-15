@@ -1,11 +1,13 @@
 //Main file for project, runs testing code
 //Command line interface for demo, testing, and training added 12/26, with much AI assistance for grunt work / printing things / I/O similar to C++
 //TODO: clean up and make code more modular. File structure can still be improved a bit. Make run functions more generic (current hard coding is a bit messy)
+//Mega-TODO (1/14): clean up code significantly, move helper functions to different files
 
 mod linear_regression;
 mod extraction;
 mod training;
 mod ip_tests;
+mod iteration_2_CNN;  //Iteration 2: CNN-based haze detection
 
 use std::env;
 use std::path::{Path, PathBuf};
@@ -21,6 +23,7 @@ use rayon::prelude::*;
 use crate::training::{train_haze_regressor, train_haze_regressor_precomputed};
 use crate::ip_tests::{image_to_array3, array3_to_image, run_all_ip_tests};
 use crate::extraction::extract_mean_dark_channel;
+use burn::backend::ndarray as burn_ndarray;  //for CNN demo device
 
 //CLI flags handling was fully AI-generated, did check over it. Rather simple/similar to C++, so I determined there wasn't really a reason I should do it manually from a learning perspective.
 fn main() {
@@ -36,6 +39,8 @@ fn main() {
         "--help" | "-h" => print_help(),
         "--ip-tests" => run_all_ip_tests(),
         "--train-full" => run_full_dataset_training(),
+        //"--train-cnn" => run_cnn_dataset_training(),  //Iteration 2: CNN training NOT RECOMMENDED TO USE, NEEDS OPTIMIZATION AND TESTING
+        "--demo-cnn" => run_cnn_demo_standalone(),   //Iteration 2: CNN demo on test images
         "--dehaze" => {
             if args.len() < 3 {
                 println!("Error: --dehaze requires an image path");
@@ -74,7 +79,9 @@ fn print_help() { //Ai-generated to save time. Checked for accuracy.
     println!("  (no args)      Run ML training demo on test images");
     println!("  --demo         Same as no args - ML training demo");
     println!("  --ip-tests     Run IP engine tests (dehazing on fog, bansui, achuge)");
-    println!("  --train-full   Train on full SealID dataset (requires dataset setup)");
+    println!("  --train-full   Train linear regression on full SealID dataset");
+    println!("  --train-cnn    Train CNN on full SealID dataset (Iteration 2)");
+    println!("  --demo-cnn     CNN training demo on test images (Iteration 2)");
     println!("  --dehaze FILE  Dehaze a specific image file with default parameters");
     println!("  --dehaze-custom FILE omega t0 patch_size guided_radius guided_eps");
     println!("                 Dehaze with custom DCP parameters");
@@ -232,6 +239,157 @@ fn run_full_dataset_training() { //I/O code was AI generated, flow was mine
         let mse = training::evaluate_mse(&regressor, &test_images, &test_labels, patch_size);
         println!("\nQuery set MSE: {:.4}", mse);
     }
+}
+
+#[allow(dead_code)] //not yet ready for use, switched to a short demo function instead
+//Iteration 2: Train CNN on full SealID dataset
+//AI-generated BECAUSE PIPELINE IS ALMOST IDENTICAL TO LINEAR REGRESSION PIPELINE
+fn run_cnn_dataset_training() {
+    println!("=== AI-Assisted Seal Photograph Image Processing System ===");
+    println!("=== Iteration 2: CNN Dataset Training ===\n");
+
+    let dataset_path = Path::new("dataset/SealID/full images/source_database");
+    if !dataset_path.exists() {
+        println!("Error: training dataset not found at {:?}", dataset_path);
+        println!("\nPlease download the SealID dataset and extract it to dataset/SealID/ per the instructions in the README");
+        return;
+    }
+
+    //Find all image files in the dataset
+    let image_paths = find_images_in_directory(dataset_path);
+    if image_paths.is_empty() {
+        println!("Error: No images found in {:?}", dataset_path);
+        return;
+    }
+    println!("Found {} images in dataset", image_paths.len());
+
+    //Load images with labels (using mean dark channel as proxy for haze)
+    let patch_size = 15;
+    println!("Loading images in parallel...");
+    let images = load_images_parallel(&image_paths);
+    println!("Successfully loaded {} images", images.len());
+
+    //Generate labels using mean dark channel
+    println!("Generating haze labels...");
+    let labels: Vec<f64> = images.iter()
+        .map(|img| extract_mean_dark_channel(img, patch_size).clamp(0.0, 1.0))
+        .collect();
+
+    if images.len() < 2 {
+        println!("Error: Need at least 2 images to train");
+        return;
+    }
+
+    //Load test images from query set
+    let query_path = Path::new("dataset/SealID/full images/source_query/");
+    let (test_images, test_labels) = if query_path.exists() {
+        let query_paths = find_random_x_images_in_directory(query_path, 10);
+        let test_imgs = load_images_parallel(&query_paths);
+        let test_lbls: Vec<f64> = test_imgs.iter()
+            .map(|img| extract_mean_dark_channel(img, patch_size).clamp(0.0, 1.0))
+            .collect();
+        (Some(test_imgs), Some(test_lbls))
+    } else {
+        println!("Query path not found, skipping test evaluation");
+        (None, None)
+    };
+
+    //Run CNN training (self-contained in iteration_2_cnn module)
+    let _trained_model = iteration_2_CNN::run_cnn_training(
+        &images,
+        &labels,
+        test_images.as_deref(),
+        test_labels.as_deref(),
+        50,     //epochs
+        8,      //batch_size
+        0.001,  //learning_rate
+    );
+
+    println!("\n=== CNN Training Complete ===");
+}
+
+//Iteration 2: CNN demo on test images, mirrors run_ml_demo() for quick testing without full dataset as a barebones proof-of-concept on the same test images to show that the CNN can be trained and produces reasonable predictions in a working pipeline
+fn run_cnn_demo_standalone() {
+    println!("=== AI-Assisted Seal Photograph Image Processing System ===");
+    println!("=== Iteration 2: CNN Training Demo ===\n");
+
+    //Same test images as run_ml_demo() for consistency
+    let test_images = vec!["fog-137794231410y.jpg", "bansui.jpg"];
+
+    let mut images: Vec<Array3<f32>> = Vec::new();
+    let mut labels: Vec<f64> = Vec::new();
+
+    //Load available test images and estimate haze labels using DCP features (same approach as linear regression)
+    for path in test_images.iter() {
+        println!("Attempting to load: {}", path);
+        match image::open(path) {
+            Ok(img) => {
+                //Downsample to 1/8 resolution for fast CNN demo (CPU training is slow) //this was AI recommendation for my laptop
+                //Full dataset training uses 1/4, but demo needs to be quick
+                let resized_img = img.resize(
+                    (img.width() / 8).max(32),  //min 32px to avoid too-small images
+                    (img.height() / 8).max(32),
+                    image::imageops::FilterType::Triangle  //faster filter for demo
+                );
+                let img_matrix = image_to_array3(&resized_img);
+
+                //Estimate haze level using mean dark channel as proxy (smaller patch for small images)
+                let mean = extract_mean_dark_channel(&img_matrix, 7); //AI recommended smaller patch due to hardware limits
+                let estimated_haze = mean.clamp(0.0, 1.0);
+
+                println!("  Loaded successfully ({}x{} -> {}x{}), estimated haze: {:.3}",
+                         img.width(), img.height(), resized_img.width(), resized_img.height(), estimated_haze);
+                images.push(img_matrix);
+                labels.push(estimated_haze);
+            }
+            Err(e) => {
+                println!("  Failed to load {}: {}", path, e);
+            }
+        }
+    }
+
+    if images.len() < 2 {
+        println!("\nWarning: Need at least 2 images for CNN training demonstration.");
+        println!("Falling back to IP engine tests...\n");
+        run_all_ip_tests();
+        return;
+    }
+
+    //Run CNN demo training (few epochs, just need to show it works)
+    let trained_model = iteration_2_CNN::run_cnn_demo(&images, &labels);
+
+    //Evaluate on training set to show predictions
+    println!("\n=== Evaluating Trained CNN ===");
+    let device = burn_ndarray::NdArrayDevice::Cpu;
+
+    for (i, (img, &label)) in images.iter().zip(labels.iter()).enumerate() {
+        let predicted = iteration_2_CNN::cnn_detection::predict_haze_cnn(&trained_model, img, &device);
+        let (omega, t0, patch, radius, eps) = iteration_2_CNN::cnn_detection::suggest_dcp_parameters(predicted);
+
+        println!("Image {}: predicted={:.3}, actual={:.3}", i + 1, predicted, label);
+        println!("  Suggested DCP params: omega={}, t0={}, patch={}, radius={}, eps={}",
+                 omega, t0, patch, radius, eps);
+    }
+
+    //Run dehazing on the first (foggy) image as demonstration with CNN-suggested parameters //AI-generated, this was the only major change from run_ml_demo()
+    println!("\n=== Running Dehazing Pipeline with CNN-Suggested Parameters ===");
+    if !images.is_empty() {
+        let predicted = iteration_2_CNN::cnn_detection::predict_haze_cnn(&trained_model, &images[0], &device);
+        let (omega, t0, patch_size, guided_radius, guided_eps) = iteration_2_CNN::cnn_detection::suggest_dcp_parameters(predicted);
+
+        println!("CNN predicted haze level: {:.3}", predicted);
+        println!("Using suggested parameters: omega={}, t0={}, patch={}, radius={}, eps={}",
+                 omega, t0, patch_size, guided_radius, guided_eps);
+
+        let dehazed = dehaze_with_params(&images[0], patch_size, omega, t0, 0.001, guided_radius, guided_eps);
+        let output_img = array3_to_image(&dehazed);
+        output_img
+            .save("output_dehazing_dcp_cnn_demo.jpg")
+            .expect("Failed to save");
+        println!("Saved dehazed result to output_dehazing_dcp_cnn_demo.jpg");
+    }
+
+    println!("\n=== CNN Demo Complete ===");
 }
 
 //Dehaze a single image from command line
