@@ -12,3 +12,6 @@ output_*.png
 # IDE files
 .idea/
 *.iml
+*.json
+
+*_full_regressor.jpg

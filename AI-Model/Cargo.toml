@@ -4,13 +4,17 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-ndarray = "0.17.1"
+ndarray = { version = "0.17.1", features = ["serde"] }
 image = "0.25.9"
 IP_functions = { path = "../IP_functions" }
 rand = "0.9"
 memmap2 = "0.9.9"
 rayon = "1.11.0"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
 
 # Burn ML framework for CNN - Iteration 2
-burn = { version = "0.16", features = ["train", "ndarray"] }
+# NOTE: fusion and autotune features removed - they cause hangs with non-power-of-2 image sizes
+burn = { version = "0.16", features = ["train", "ndarray", "wgpu"] }
 burn-ndarray = "0.16"
+wgpu = "0.20"

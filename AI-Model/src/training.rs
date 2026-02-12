@@ -3,14 +3,19 @@
 
 ///Q: Why a regressor?
 ///A: Haze levels are continuous, so I decided to use a regressor instead of a classifier such as a decision tree or perceptron.
-
-//TODO: add model serialization/deserialization for persistence
+///Q: What's serde?
+///A: Serde is a crate for serializing and deserializing Rust data structures efficiently and generically for model persistence. 
 
 use ndarray::{Array1, Array2, Axis};
+use serde::{Serialize, Deserialize};
+use std::fs::File;
+use std::io::{BufReader, BufWriter};
+use std::path::Path;
 use crate::linear_regression::LinearRegression;
 use crate::extraction::extract_all_features;
 
 //Wrapper around LinearRegression that stores normalization parameters so that predictions use the same scaling as training
+#[derive(Serialize, Deserialize)]
 pub struct HazeRegressor {
     pub model: LinearRegression,
     pub feature_mins: Array1<f64>,
@@ -29,6 +34,32 @@ impl HazeRegressor { //AI generated after it pointed out the need for normalizat
             }
         }
         normalized
+    }
+
+    /*
+    Save the trained model to a JSON file for persistence across sessions that stores weights, bias, and normalization parameters so the trained can be reloaded later and used without retraining
+
+    @param: path: file path to save the model (typically .json extension)
+    @return: Ok(()) on success, or error if file creation/serialization fails
+    */
+    pub fn save<P: AsRef<Path>>(&self, path: P) -> Result<(), Box<dyn std::error::Error>> {
+        let file = File::create(path)?;
+        let writer = BufWriter::new(file);
+        serde_json::to_writer_pretty(writer, self)?;
+        Ok(())
+    }
+
+    /*
+    Load a trained model from a JSON file, restores weights, bias, and normalization parameters from a previously saved model
+
+    @param: path: file path to load the model from
+    @return: HazeRegressor on success, or error if file not found/deserialization fails
+    */
+    pub fn load<P: AsRef<Path>>(path: P) -> Result<Self, Box<dyn std::error::Error>> {
+        let file = File::open(path)?;
+        let reader = BufReader::new(file);
+        let regressor = serde_json::from_reader(reader)?;
+        Ok(regressor)
     }
 }
 

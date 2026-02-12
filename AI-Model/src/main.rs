@@ -1,7 +1,10 @@
-//Main file for project, runs testing code
+//Main file for project, runs testing and production code
 //Command line interface for demo, testing, and training added 12/26, with much AI assistance for grunt work / printing things / I/O similar to C++
 //TODO: clean up and make code more modular. File structure can still be improved a bit. Make run functions more generic (current hard coding is a bit messy)
 //Mega-TODO (1/14): clean up code significantly, move helper functions to different files
+//TODO 1/29: cut unnecessary functions, or keep them for demonstration? Perhaps move to a different "old code" folder? Need to decide.
+
+//TODO 2/3: take an entire week or so just to clean up the code and make it more modular / robust. AKA do the other TODO's
 
 mod linear_regression;
 mod extraction;
@@ -38,9 +41,53 @@ fn main() {
     match args[1].as_str() {
         "--help" | "-h" => print_help(),
         "--ip-tests" => run_all_ip_tests(),
-        "--train-full" => run_full_dataset_training(),
-        //"--train-cnn" => run_cnn_dataset_training(),  //Iteration 2: CNN training NOT RECOMMENDED TO USE, NEEDS OPTIMIZATION AND TESTING
+        "--train-full-demo" => run_full_dataset_training(),
+        "--train-cnn" => run_cnn_dataset_training(),  //Iteration 2: CNN training on full dataset (CPU)
+        "--train-cnn-gpu" => run_cnn_dataset_training_gpu(),  //Iteration 2: CNN training on full dataset (GPU - FAST)
+        "--train-cnn-gpu-save" => {
+            //Train CNN on GPU and save model for later inference
+            if args.len() < 3 {
+                println!("Error: --train-cnn-gpu-save requires a model output path");
+                println!("Usage: cargo run -p ai-model -- --train-cnn-gpu-save cnn_model");
+                return;
+            }
+            run_cnn_gpu_training_and_save(&args[2]);
+        }
+        "--process-cnn-gpu" => {
+            //Load saved CNN model and process an image on GPU
+            if args.len() < 5 {
+                println!("Error: --process-cnn-gpu requires model path, input image, and output path");
+                println!("Usage: cargo run -p ai-model -- --process-cnn-gpu cnn_model input.jpg output.jpg");
+                return;
+            }
+            run_process_with_cnn_gpu(&args[2], &args[3], &args[4]);
+        }
         "--demo-cnn" => run_cnn_demo_standalone(),   //Iteration 2: CNN demo on test images
+        "--train-save" => { //Iteration 2: CPU-only training on demo images and save model
+            if args.len() < 3 {
+                println!("Error: --train-save requires a model output path");
+                println!("Usage: cargo run -p ai-model -- --train-save model.json");
+                return;
+            }
+            run_train_and_save(&args[2]);
+        }
+        "--train-full-save" => {
+            if args.len() < 3 {
+                println!("Error: --train-full-save requires a model output path");
+                println!("Usage: cargo run -p ai-model -- --train-full-save model.json");
+                return;
+            }
+            run_full_training_and_save(&args[2]);
+        }
+        "--process" => {
+            // Load saved model and process an image
+            if args.len() < 5 {
+                println!("Error: --process requires model path, input image, and output path");
+                println!("Usage: cargo run -p ai-model -- --process model.json input.jpg output.jpg");
+                return;
+            }
+            run_process_with_model(&args[2], &args[3], &args[4]);
+        }
         "--dehaze" => {
             if args.len() < 3 {
                 println!("Error: --dehaze requires an image path");
@@ -79,13 +126,29 @@ fn print_help() { //Ai-generated to save time. Checked for accuracy.
     println!("  (no args)      Run ML training demo on test images");
     println!("  --demo         Same as no args - ML training demo");
     println!("  --ip-tests     Run IP engine tests (dehazing on fog, bansui, achuge)");
-    println!("  --train-full   Train linear regression on full SealID dataset");
-    println!("  --train-cnn    Train CNN on full SealID dataset (Iteration 2)");
+    println!("  --train-full-demo");
+    println!("                 Train linear regression on full SealID dataset");
+    println!("  --train-save MODEL_PATH");
+    println!("                 Train on demo images and save model to file");
+    println!("  --train-full-save MODEL_PATH");
+    println!("                 Train on full SealID dataset and save model to file");
+    println!("  --process MODEL_PATH INPUT_IMAGE OUTPUT_IMAGE");
+    println!("                 Load saved model and dehaze an image");
+    println!("  --train-cnn    Train CNN on full SealID dataset (CPU - slow)");
+    println!("  --train-cnn-gpu");
+    println!("                 Train CNN on full SealID dataset (GPU - FAST, use only for devices with dedicated GPUs (graphics cards))");
+    println!("  --train-cnn-gpu-save MODEL_PATH");
+    println!("                 Train CNN on GPU and save model for later inference");
+    println!("  --process-cnn-gpu MODEL_PATH INPUT_IMAGE OUTPUT_IMAGE");
+    println!("                 Load saved CNN model and dehaze an image (GPU)");
     println!("  --demo-cnn     CNN training demo on test images (Iteration 2)");
     println!("  --dehaze FILE  Dehaze a specific image file with default parameters");
     println!("  --dehaze-custom FILE omega t0 patch_size guided_radius guided_eps");
     println!("                 Dehaze with custom DCP parameters");
     println!("  --help, -h     Show this help message\n");
+    println!("Model Persistence:");
+    println!("  Train and save: cargo run -p ai-model -- --train-save haze_model.json");
+    println!("  Process image:  cargo run -p ai-model -- --process haze_model.json foggy.jpg clear.jpg\n");
     println!("Custom Dehazing Parameters:");
     println!("  omega          Haze retention factor [0-1], lower = more dehaze (default: 0.95)");
     println!("  t0             Min transmission [0-1], higher = less noise (default: 0.1)");
@@ -241,7 +304,7 @@ fn run_full_dataset_training() { //I/O code was AI generated, flow was mine
     }
 }
 
-#[allow(dead_code)] //not yet ready for use, switched to a short demo function instead
+//#[allow(dead_code)] //not yet ready for use, switched to a short demo function instead //IT'S ALIVE, IT'S ALIVE!
 //Iteration 2: Train CNN on full SealID dataset
 //AI-generated BECAUSE PIPELINE IS ALMOST IDENTICAL TO LINEAR REGRESSION PIPELINE
 fn run_cnn_dataset_training() {
@@ -295,7 +358,7 @@ fn run_cnn_dataset_training() {
     };
 
     //Run CNN training (self-contained in iteration_2_cnn module)
-    let _trained_model = iteration_2_CNN::run_cnn_training(
+    let _trained_model = iteration_2_CNN::run_cnn_training::<&str>(
         &images,
         &labels,
         test_images.as_deref(),
@@ -303,9 +366,213 @@ fn run_cnn_dataset_training() {
         50,     //epochs
         8,      //batch_size
         0.001,  //learning_rate
+        None,   //save_path
     );
 
     println!("\n=== CNN Training Complete ===");
+}
+
+//Iteration 2: Train CNN on full SealID dataset using GPU acceleration, which is MUCH FASTER than CPU, but is still the same pipeline as run_cnn_dataset_training but uses wgpu backend for GPU compute, use this method on machines that have a GPU if possible.
+fn run_cnn_dataset_training_gpu() {
+    println!("=== AI-Assisted Seal Photograph Image Processing System ===");
+    println!("=== Iteration 2: CNN Dataset Training (GPU) ===\n");
+
+    let dataset_path = Path::new("dataset/SealID/full images/source_database");
+    if !dataset_path.exists() {
+        println!("Error: training dataset not found at {:?}", dataset_path);
+        println!("\nPlease download the SealID dataset and extract it to dataset/SealID/ per the instructions in the README");
+        return;
+    }
+
+    let image_paths = find_images_in_directory(dataset_path);
+    if image_paths.is_empty() {
+        println!("Error: No images found in {:?}", dataset_path);
+        return;
+    }
+    println!("Found {} images in dataset", image_paths.len());
+
+    let patch_size = 15;
+    println!("Loading images in parallel...");
+    let images = load_images_parallel(&image_paths);
+    println!("Successfully loaded {} images", images.len());
+
+    println!("Generating haze labels...");
+    let labels: Vec<f64> = images.iter()
+        .map(|img| extract_mean_dark_channel(img, patch_size).clamp(0.0, 1.0))
+        .collect();
+
+    if images.len() < 2 {
+        println!("Error: Need at least 2 images to train");
+        return;
+    }
+
+    //Load test images from query set
+    let query_path = Path::new("dataset/SealID/full images/source_query");
+    let (test_images, test_labels) = if query_path.exists() {
+        let query_paths = find_random_x_images_in_directory(query_path, 10);
+        let test_imgs = load_images_parallel(&query_paths);
+        let test_lbls: Vec<f64> = test_imgs.iter()
+            .map(|img| extract_mean_dark_channel(img, patch_size).clamp(0.0, 1.0))
+            .collect();
+        (Some(test_imgs), Some(test_lbls))
+    } else {
+        println!("Query path not found, skipping test evaluation");
+        (None, None)
+    };
+
+    //Run GPU-accelerated CNN training
+    let _trained_model = iteration_2_CNN::run_cnn_training_gpu::<&str>(
+        &images,
+        &labels,
+        test_images.as_deref(),
+        test_labels.as_deref(),
+        50,     //epochs - can do more since GPU is faster
+        0.001,  //learning_rate
+        None,   //save_path
+    );
+
+    println!("\n=== GPU CNN Training Complete ===");
+}
+
+/*
+Trains CNN on full SealID dataset using GPU acceleration and saves model to disk for later inference, basically run_cnn_dataset_training_gpu() but with persistence so you can train once and reuse the model later without retraining overhead that makes the tool impractical to actually use
+Flow is identical to run_cnn_dataset_training_gpu() with a save path passed to the training function that writes out the model weights
+Purpose: I felt it was best to have two training functions (one with persistence and one without) for GPU as I already did for CPU training, just to keep things consistent and avoid confusion. Functions need to be consolidated later. 
+
+@param: model_path: path to save the model file (WITHOUT .mpk extension, burn adds it automatically)
+*/
+fn run_cnn_gpu_training_and_save(model_path: &str) {
+    println!("=== AI-Assisted Seal Photograph Image Processing System ===");
+    println!("=== Iteration 2: CNN Dataset Training (GPU) with Model Save ===\n");
+
+    let dataset_path = Path::new("dataset/SealID/full images/source_database");
+    if !dataset_path.exists() {
+        println!("Error: training dataset not found at {:?}", dataset_path);
+        println!("\nPlease download the SealID dataset and extract it to dataset/SealID/ per the instructions in the README");
+        return;
+    }
+
+    let image_paths = find_images_in_directory(dataset_path);
+    if image_paths.is_empty() {
+        println!("Error: No images found in {:?}", dataset_path);
+        return;
+    }
+    println!("Found {} images in dataset", image_paths.len());
+
+    let patch_size = 15;
+    println!("Loading images in parallel...");
+    let images = load_images_parallel(&image_paths);
+    println!("Successfully loaded {} images", images.len());
+
+    println!("Generating haze labels...");
+    let labels: Vec<f64> = images.iter()
+        .map(|img| extract_mean_dark_channel(img, patch_size).clamp(0.0, 1.0))
+        .collect();
+
+    if images.len() < 2 {
+        println!("Error: Need at least 2 images to train");
+        return;
+    }
+
+    //Load test images from query set
+    let query_path = Path::new("dataset/SealID/full images/source_query");
+    let (test_images, test_labels) = if query_path.exists() {
+        let query_paths = find_random_x_images_in_directory(query_path, 10);
+        let test_imgs = load_images_parallel(&query_paths);
+        let test_lbls: Vec<f64> = test_imgs.iter()
+            .map(|img| extract_mean_dark_channel(img, patch_size).clamp(0.0, 1.0))
+            .collect();
+        (Some(test_imgs), Some(test_lbls))
+    } else {
+        println!("Query path not found, skipping test evaluation");
+        (None, None)
+    };
+
+    //Run GPU-accelerated CNN training with save path
+    let _trained_model = iteration_2_CNN::run_cnn_training_gpu(
+        &images,
+        &labels,
+        test_images.as_deref(),
+        test_labels.as_deref(),
+        50,     //epochs
+        0.001,  //learning_rate
+        Some(model_path),  //save_path - this is the key difference
+    );
+
+    println!("\n=== GPU CNN Training Complete ===");
+    println!("Model saved to: {}.mpk", model_path);
+}
+
+/*
+Loads a saved CNN model and processes an image using GPU acceleration which is the main inference/production use case for the CNN pipeline, loads the model weights from disk and uses it to predict haze level on a new image then dehazes based on the prediction using suggested DCP parameters, mirrors run_process_with_model() for linear regression but uses CNN instead
+This is the "train once with --train-cnn-gpu-save, then use --process-cnn-gpu on new images" workflow for real usage
+
+@param: model_path: path to the saved model file (WITHOUT .mpk extension)
+@param: input_path: path to the input image to dehaze
+@param: output_path: path to save the dehazed output image
+*/
+fn run_process_with_cnn_gpu(model_path: &str, input_path: &str, output_path: &str) {
+    use burn::backend::wgpu::WgpuDevice;
+
+    println!("=== AI-Assisted Seal Photograph Image Processing System ===");
+    println!("=== Process Image with Saved CNN Model (GPU) ===\n");
+
+    //Load the saved CNN model on GPU
+    println!("Loading CNN model from: {}.mpk", model_path);
+    let model = match iteration_2_CNN::load_pretrained_model_gpu(model_path) {
+        Ok(m) => {
+            println!("CNN model loaded successfully on GPU!");
+            m
+        }
+        Err(e) => {
+            println!("Error loading model: {}", e);
+            return;
+        }
+    };
+
+    //Load the input image
+    println!("\nLoading input image: {}", input_path);
+    let img = match image::open(input_path) {
+        Ok(img) => img,
+        Err(e) => {
+            println!("Error: Failed to open image: {}", e);
+            return;
+        }
+    };
+
+    let img_matrix = image_to_array3(&img);
+    println!("Image loaded: {}x{}", img.width(), img.height());
+
+    //Predict haze level using CNN on GPU
+    let device = WgpuDevice::default();
+    let haze_score = iteration_2_CNN::predict_haze_cnn(&model, &img_matrix, &device);
+    println!("\nCNN predicted haze score: {:.4}", haze_score);
+    println!("  (0.0 = clear, 1.0 = heavy haze)");
+
+    //Choose dehazing parameters based on CNN haze prediction
+    let (omega, t0, patch_size, guided_radius, guided_eps) = iteration_2_CNN::suggest_dcp_parameters(haze_score);
+
+    if haze_score > 0.7 {
+        println!("\nHigh haze detected - using aggressive dehazing parameters");
+    } else if haze_score > 0.4 {
+        println!("\nModerate haze detected - using balanced dehazing parameters");
+    } else {
+        println!("\nLow haze detected - using gentle dehazing parameters");
+    }
+    println!("  omega={}, t0={}, patch_size={}, guided_radius={}, guided_eps={}",
+                omega,    t0,    patch_size,    guided_radius,    guided_eps);
+
+    println!("\nRunning Dark Channel Prior dehazing...");
+    let top_percent = 0.001;
+    let dehazed = dehaze_with_params(&img_matrix, patch_size, omega, t0, top_percent, guided_radius, guided_eps);
+
+    let output_img = array3_to_image(&dehazed);
+    match output_img.save(output_path) {
+        Ok(_) => println!("\nDehazed image saved to: {}", output_path),
+        Err(e) => println!("\nError saving output: {}", e),
+    }
+
+    println!("\n=== Processing Complete ===");
 }
 
 //Iteration 2: CNN demo on test images, mirrors run_ml_demo() for quick testing without full dataset as a barebones proof-of-concept on the same test images to show that the CNN can be trained and produces reasonable predictions in a working pipeline
@@ -460,6 +727,188 @@ fn dehaze_with_custom_params(img_path: &str, omega: f32, t0: f32, patch_size: us
         .expect("Failed to save");
 
     println!("Saved dehazed result to {}", output_path);
+}
+
+/*
+Train on demo images and save model to a JSON file for later use, which is key for model persistence so the user can train once and then use the model later without retraining which has a large overhead and prevents realistic use.
+Basically just run_ml_demo() but with a save call at the end to the functions in training.rs, mirrors the same training flow but outputs to disk instead of just printing weights
+
+@param: model_path: path to save the model JSON file (e.g. "haze_model.json")
+*/
+fn run_train_and_save(model_path: &str) {
+    println!("=== AI-Assisted Seal Photograph Image Processing System ===");
+    println!("=== Train and Save Model ===\n");
+
+    //Same test images as run_ml_demo()
+    let test_images = vec!["fog-137794231410y.jpg", "bansui.jpg"];
+
+    let mut images: Vec<Array3<f32>> = Vec::new();
+    let mut labels: Vec<f64> = Vec::new();
+
+    for path in test_images.iter() {
+        println!("Attempting to load: {}", path);
+        match image::open(path) {
+            Ok(img) => {
+                let img_matrix = image_to_array3(&img);
+                let mean = extract_mean_dark_channel(&img_matrix, 15);
+                let estimated_haze = mean.clamp(0.0, 1.0);
+                images.push(img_matrix);
+                labels.push(estimated_haze);
+                println!("  Loaded successfully, estimated haze label: {:.3}", estimated_haze);
+            }
+            Err(e) => {
+                println!("  Failed to load {}: {}", path, e);
+            }
+        }
+    }
+
+    if images.len() < 2 {
+        println!("\nError: Need at least 2 images for training.");
+        return;
+    }
+
+    println!("\n=== Training Linear Regression Haze Regressor ===");
+    let patch_size = 15;
+    let learning_rate = 0.1;
+    let epochs = 100;
+
+    let regressor = train_haze_regressor(&images, &labels, patch_size, learning_rate, epochs);
+
+    //Save the model
+    match regressor.save(model_path) {
+        Ok(_) => println!("\nModel saved successfully to: {}", model_path),
+        Err(e) => println!("\nError saving model: {}", e),
+    }
+
+    println!("\n=== Training Complete ===");
+    println!("Model weights: {:?}", regressor.model.weights);
+    println!("Model bias: {:.4}", regressor.model.bias);
+}
+
+/*
+Trains regressor on full SealID dataset and save model to a JSON file, same as run_full_dataset_training() but with persistence to avert overhead from retraining every single time, also reduces overhead via precomputed features during loading to avoid recomputing DCP as in run_full_dataset_training()
+Flow is basically identical to run_full_dataset_training() with a save call tacked on at the end to training.rs's save function
+
+@param: model_path: path to save the model JSON file
+*/
+fn run_full_training_and_save(model_path: &str) {
+    println!("=== AI-Assisted Seal Photograph Image Processing System ===");
+    println!("=== Full Dataset Training with Model Save ===\n");
+
+    let dataset_path = Path::new("dataset/SealID/full images/source_database");
+    if !dataset_path.exists() {
+        println!("Error: training dataset not found at {:?}", dataset_path);
+        println!("\nPlease download the SealID dataset and extract it to dataset/SealID/ per the instructions in the README");
+        return;
+    }
+
+    let image_paths = find_images_in_directory(dataset_path);
+    if image_paths.is_empty() {
+        println!("Error: No images found in {:?}", dataset_path);
+        return;
+    }
+    println!("Found {} images in dataset", image_paths.len());
+
+    let patch_size = 15;
+    println!("Loading images and extracting features in parallel...");
+    let (_images, labels, features) = load_images_with_features(&image_paths, patch_size);
+    println!("Successfully loaded {} images with precomputed features", labels.len());
+
+    if labels.len() < 2 {
+        println!("Error: Need at least 2 images to train");
+        return;
+    }
+
+    println!("\n=== Training on {} images ===", labels.len());
+    let learning_rate = 0.01;
+    let epochs = 200;
+
+    let regressor = train_haze_regressor_precomputed(&features, &labels, learning_rate, epochs);
+
+    //Save the model
+    match regressor.save(model_path) {
+        Ok(_) => println!("\nModel saved successfully to: {}", model_path),
+        Err(e) => println!("\nError saving model: {}", e),
+    }
+
+    println!("\n=== Training Complete ===");
+    println!("Model weights: {:?}", regressor.model.weights);
+    println!("Model bias: {:.4}", regressor.model.bias);
+}
+
+/*
+Loads a saved model and processes an image, which is the main inference function that makes persistence  useful, loads the JSON model file and uses it to predict haze level on a new image then automatically picks DCP parameters based on the prediction and dehazes the image
+The parameter selection is based on haze score thresholds: high haze (>0.7) gets aggressive dehazing with lower omega, moderate haze (0.4-0.7) gets balanced params, low haze (<0.4) gets gentle params to avoid overcorrecting, would need to add more variables to the regressor to move beyond a simple heuristic
+This is basically the "production" use case of "train once with --train-save or --train-full-save, then use --process on new images without retraining"
+
+@param: model_path: path to the saved model JSON file from training
+@param: input_path: path to the input image to dehaze
+@param: output_path: path to save the dehazed output image
+*/
+fn run_process_with_model(model_path: &str, input_path: &str, output_path: &str) {
+    println!("=== AI-Assisted Seal Photograph Image Processing System ===");
+    println!("=== Process Image with Saved Model ===\n");
+
+    //Load the saved model
+    println!("Loading model from: {}", model_path);
+    let regressor = match training::HazeRegressor::load(model_path) {
+        Ok(r) => {
+            println!("Model loaded successfully!");
+            println!("  Weights: {:?}", r.model.weights);
+            println!("  Bias: {:.4}", r.model.bias);
+            r
+        }
+        Err(e) => {
+            println!("Error loading model: {}", e);
+            return;
+        }
+    };
+
+    //Load the input image
+    println!("\nLoading input image: {}", input_path);
+    let img = match image::open(input_path) {
+        Ok(img) => img,
+        Err(e) => {
+            println!("Error: Failed to open image: {}", e);
+            return;
+        }
+    };
+
+    let img_matrix = image_to_array3(&img);
+    println!("Image loaded: {}x{}", img.width(), img.height());
+
+    //Predict haze level of input image
+    let patch_size = 15;
+    let haze_score = training::predict_haze_score(&regressor, &img_matrix, patch_size);
+    println!("\nPredicted haze score: {:.4}", haze_score);
+    println!("  (0.0 = clear, 1.0 = heavy haze)");
+
+    //Choose dehazing parameters based on haze level, higher haze begets more aggressive dehazing (lower omega, higher t0)
+    let (omega, t0, guided_radius, guided_eps) = if haze_score > 0.7 {
+        println!("\nHigh haze detected - using aggressive dehazing parameters");
+        (0.6_f32, 0.3_f32, 30_usize, 0.0001_f32)
+    } else if haze_score > 0.4 {
+        println!("\nModerate haze detected - using balanced dehazing parameters");
+        (0.75_f32, 0.2_f32, 45_usize, 0.0001_f32)
+    } else {
+        println!("\nLow haze detected - using gentle dehazing parameters");
+        (0.85_f32, 0.15_f32, 60_usize, 0.0001_f32)
+    };
+
+    println!("  omega={}, t0={}, patch_size={}, guided_radius={}, guided_eps={}",
+                omega,    t0,    patch_size,    guided_radius,    guided_eps); //Whitespace OCD
+
+    println!("\nRunning Dark Channel Prior dehazing...");
+    let top_percent = 0.001;
+    let dehazed = dehaze_with_params(&img_matrix, patch_size, omega, t0, top_percent, guided_radius, guided_eps);
+
+    let output_img = array3_to_image(&dehazed);
+    match output_img.save(output_path) {
+        Ok(_) => println!("\nDehazed image saved to: {}", output_path),
+        Err(e) => println!("\nError saving output: {}", e),
+    }
+
+    println!("\n=== Processing Complete ===");
 }
 
 //Find all image files recursively in a directory

@@ -8,7 +8,9 @@
 //TODO: further testing if necessary, extension to more variables, etc.
 
 use ndarray::{Array1, Array2};
+use serde::{Serialize, Deserialize}; //Makes struct serializable (save-able) to JSON for saving/loading model weights
 
+#[derive(Serialize, Deserialize)]
 pub struct LinearRegression {
     pub weights: Array1<f64>,
     pub bias: f64,
