@@ -6,6 +6,9 @@
 
 //TODO 2/3: take an entire week or so just to clean up the code and make it more modular / robust. AKA do the other TODO's
 
+// Required for wgpu 26 / burn 0.20.1 compatibility - wgpu-core types have deep nesting
+#![recursion_limit = "512"]
+
 mod linear_regression;
 mod extraction;
 mod training;
@@ -111,6 +114,27 @@ fn main() {
             let guided_eps: f32 = args[7].parse().unwrap_or_else(|_| { println!("Invalid guided_eps, using 0.0001"); 0.0001 });
             dehaze_with_custom_params(&args[2], omega, t0, patch_size, guided_radius, guided_eps);
         }
+        "--clahe" => {
+            if args.len() < 3 {
+                println!("Error: --clahe requires an image path");
+                println!("Usage: cargo run -p ai-model -- --clahe path/to/image.jpg");
+                return;
+            }
+            ip_tests::clahe_single_image(&args[2]);
+        }
+        "--clahe-custom" => {
+            //Usage: --clahe-custom FILE grid_h grid_w clip_limit
+            if args.len() < 6 {
+                println!("Error: --clahe-custom requires image path and 3 parameters");
+                println!("Usage: cargo run -p ai-model -- --clahe-custom FILE grid_h grid_w clip_limit");
+                println!("Example: cargo run -p ai-model -- --clahe-custom image.jpg 8 8 3.0");
+                return;
+            }
+            let grid_h: usize = args[3].parse().unwrap_or_else(|_| { println!("Invalid grid_h, using 8"); 8 });
+            let grid_w: usize = args[4].parse().unwrap_or_else(|_| { println!("Invalid grid_w, using 8"); 8 });
+            let clip_limit: f32 = args[5].parse().unwrap_or_else(|_| { println!("Invalid clip_limit, using 2.5"); 2.5 });
+            ip_tests::clahe_with_custom_params(&args[2], grid_h, grid_w, clip_limit);
+        }
         "--demo" => run_ml_demo(),
         _ => {
             println!("Unknown option: {}", args[1]);
@@ -145,6 +169,9 @@ fn print_help() { //Ai-generated to save time. Checked for accuracy.
     println!("  --dehaze FILE  Dehaze a specific image file with default parameters");
     println!("  --dehaze-custom FILE omega t0 patch_size guided_radius guided_eps");
     println!("                 Dehaze with custom DCP parameters");
+    println!("  --clahe FILE   Enhance contrast of an image with CLAHE (default parameters)");
+    println!("  --clahe-custom FILE grid_h grid_w clip_limit");
+    println!("                 Enhance contrast with custom CLAHE parameters");
     println!("  --help, -h     Show this help message\n");
     println!("Model Persistence:");
     println!("  Train and save: cargo run -p ai-model -- --train-save haze_model.json");
@@ -155,6 +182,10 @@ fn print_help() { //Ai-generated to save time. Checked for accuracy.
     println!("  patch_size     Dark channel patch size in pixels (default: 15)");
     println!("  guided_radius  Guided filter radius, larger = smoother (default: 60)");
     println!("  guided_eps     Guided filter epsilon, smaller = sharper (default: 0.0001)\n");
+    println!("CLAHE Parameters:");
+    println!("  grid_h         Number of tile rows (default: 8, more = more local contrast)");
+    println!("  grid_w         Number of tile columns (default: 8)");
+    println!("  clip_limit     Contrast limit multiplier (default: 2.5, range 1.5-4.0)\n");
     println!("Example:");
     println!("  cargo run -p ai-model -- --dehaze-custom image.jpg 0.75 0.25 15 15 0.0001\n");
     println!("Dataset Setup:");

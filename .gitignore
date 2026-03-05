@@ -15,3 +15,7 @@ output_*.png
 *.json
 
 *_full_regressor.jpg
+
+*.txt
+
+*.mpk

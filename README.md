@@ -1,23 +1,54 @@
 # AI-Assisted Seal Photograph Image Processing and Correction System
+# NOTE: DOCUMENTATION IN FILES EXCEPT README.md IS OUTDATED AND MAY BE INCORRECT. WILL NEED UPDATING AS OF 3/4/2026.
 
-**What is this?** A Rust-based image processing system for underwater/hazy seal photographs that uses machine learning to detect haze levels and automatically apply dehazing corrections. 
+## Summary
+
+A Rust-based image processing and machine learning system for enhancing seal photographs taken in hazy, foggy, or underwater conditions. The system can **detect haze levels** in images using a trained CNN or linear regression model, **automatically dehaze** them using the Dark Channel Prior algorithm with ML-suggested parameters, and **enhance local contrast** using CLAHE (Contrast Limited Adaptive Histogram Equalization). Trained on the SealID dataset (~2000+ seal images with varying haze conditions) using GPU-accelerated training with image tiling for large images.
+
+### Key Features
+- **Haze Detection & Dehazing:** Dark Channel Prior (DCP) pipeline with guided filter refinement for automatic haze removal
+- **ML-Guided Parameter Selection:** CNN (Iteration 2) or linear regression (Iteration 1) predicts haze level and auto-selects optimal dehazing parameters
+- **CLAHE Contrast Enhancement:** Adaptive local contrast enhancement that brings out detail in seal fur, textures, and backgrounds without over-amplifying noise
+- **GPU-Accelerated CNN Training:** wgpu backend with dimension-grouped batching and image tiling for large images (RTX 3070 tested)
+- **Model Persistence:** Train once, save model, process new images without retraining
+- **CLI Interface:** Full command-line interface for training, processing, and testing
+
+### Quick Start
+```bash
+# Dehaze an image with default parameters
+cargo run -p ai-model --release -- --dehaze image.jpg
+
+# Enhance contrast with CLAHE
+cargo run -p ai-model --release -- --clahe image.jpg
+
+# Train CNN on GPU and save model (requires dataset)
+cargo run -p ai-model --release -- --train-cnn-gpu-save cnn_model
+
+# Process image with trained CNN model
+cargo run -p ai-model --release -- --process-cnn-gpu cnn_model input.jpg output.jpg
+```
+
+---
+
+**What is this?** A Rust-based image processing system for underwater/hazy seal photographs that uses machine learning to detect haze levels and automatically apply dehazing corrections, plus CLAHE for local contrast enhancement.
 **What project?** Built as an Arizona State University (ASU, *insert something about #1 in INNOVATION here*) Barrett Honors College Honors Thesis (for my B.S. in Computer Science, Cybersecurity concentration) to explore AI-assisted image processing in Rust, expanding my Capstone Project with GDMS to "Develop a Web Server and Packet Sniffer in Rust" as a service mounted to the web server. 
 **Why Rust?** Safety and efficiency are key to this project, and exploring the state of Rust's machine learning ecosystem was a good opportunity to learn more about Rust AND ML.
 **Why seals?** The SealID dataset provides a good variety of hazy images (snow, mist, fog) for testing haze detection and correction algorithms, plus seals are cute and the dataset was freely available for research purposes, and lastly the scope is rather unique. 
 
-**Two iterations:**
+**Two iterations of code so far (ML + image processing functions are both improved in each iteration):**
 1. **Iteration 1 (Complete):** Linear regression model trained on Dark Channel Prior features to predict haze levels and suggest dehazing parameters, can feed it images via CLI after loading a pretrained / saved / persistent model.
-2. **Iteration 2 (WIP):** Convolutional Neural Network for improved accuracy, with CPU and GPU backends... except GPU training is currently broken (see Known Issues below)
+2. **Iteration 2 (GPU Training Working as of 2/25, further polishing and functions):** Convolutional Neural Network for improved accuracy, with CPU and GPU backends. GPU training works with image tiling and memory management (see GPU Training Journey below).
+3. **Image Processing Functions:** DCP-based dehazing (Iteration 1) and CLAHE contrast enhancement (added 3/4/2026).
 
 Note: some of the README was AI-generated based on my comments in the code. Less of it is AI generated now than before, excluding the summary of my GPU training issues below, which was based on my own recollection of what issues I was having.   
 
-Status as of 2/11/2026: Iteration 1 complete with manual query pipeline. Iteration 2 CNN pipeline has model persistence and manual query feature for both CPU and GPU backends but **GPU training hangs at first epoch** due to what appears to be a wgpu/burn shader compilation issue with larger image sizes. CPU training works but is slow. See Known Issues section for the full debugging saga.
+Status as of 3/4/2026: Iteration 1 complete. Iteration 2 CNN GPU training **working** (fixed 2/19 through 2/25 in stages) with image tiling for oversized images — trains on 430+ images with ~0.002 MSE. CLAHE contrast enhancement added, much needed README update. Next steps: web server integration, more IP functions, polishing, update other documentation inside of code files. 
 
-## Known Issues (2/11/2026)
+## GPU Training Journey (First written 2/11, Irrelevant by 2/19, but useful for reference)
 
-### GPU Training Hangs at First Epoch (AI summary of my long list of steps taken in cnn_detection.rs)
+### The Problem: GPU Training Hangs at First Epoch
 
-**TLDR:** GPU training hangs during backward pass for images larger than 256x256. Forward pass works, loss computes, but `loss.backward()` never returns. 256x256 works fine, 512x512 hangs indefinitely.
+**TLDR:** GPU training hung during backward pass for images larger than 256x256. Forward pass worked, loss computed, but `loss.backward()` never returned. **RESOLVED 2/19** by upgrading burn 0.16→0.20.1, adding `into_scalar()` to force wgpu fusion flushes before backward pass, using `fork()` to detach autodiff graphs between batches, and tiling oversized images (>400K pixels) into ~350×350 tiles.
 
 **The Long Debugging Journey (for my capstone sponsor and anyone else who's curious, this is MUCH more in depth in cnn_detection.rs):**
 
@@ -39,19 +70,33 @@ Status as of 2/11/2026: Iteration 1 complete with manual query pipeline. Iterati
 | 1.5.3 | Narrowing down location | Found issue is at loss.backward() around line 1006 in cnn_detection.rs                          |
 | 1.5.4 | GPU async not syncing | Tried force sync via GradientsParams::from_grads() and drop() - didn't help                     |
 
-**Current workaround:** Use CPU training (slow but works) or resize all images to 256x256 before GPU training (may have to resort to this if I can't find another method)
-**Plans:** try to work out why GPU training hangs at first epoch for larger images, or work around this somehow (breaking up images perhaps? or using a different backend?)
+**Solution (2/18–2/25):** The fix required multiple changes working together:
+1. **Upgraded burn 0.16 → 0.20.1** (and wgpu 26 to match) — newer wgpu backend handles larger shader compilations better
+2. **`into_scalar()` before `backward()`** — forces the wgpu fusion backend to flush pending GPU work before starting the backward pass, preventing the hang
+3. **`fork()` after each optimizer step** — detaches the autodiff graph so gradient history doesn't accumulate in GPU memory across batches
+4. **Scoped tensor drops** — forward pass tensors are dropped before the next batch starts, freeing GPU memory
+5. **Image tiling** — images >400K pixels are split into ~350×350 non-overlapping tiles (each inherits the parent's haze label since haze is scene-wide), so nothing is skipped
 
-**If you figure this out:** Please submit a PR or open an issue, I would genuinely love to know what's wrong here.
+**Training Results (2/25, 50 epochs):**
+- 430 images trained per epoch (282 directly + 148 oversized images tiled into smaller patches)
+- ~191 seconds per epoch (~3.2 minutes) on RTX 3070
+- Final MSE: ~0.002 (test set MSE: ~0.003)
+- Total training time: ~2.7 hours
+- No OOM crashes across all 50 epochs
+
+**If hitting similar wgpu/burn backward pass hangs:** The key insight is that `into_scalar()` forces a GPU sync that prevents the fusion backend from building up an impossibly large fused kernel. Without it, the backward pass tries to compile a single massive shader that exceeds GPU limits.
+
 **Also, please gaze upon the seals while you're here. They are cute.**
 ---
 
 TODO:  
-  - Figure out why GPU training hangs (see above)
-  - More testing for Iteration 2 CNN on better hardware? (currently on RTX 3070 machine)
-  - Add more IP functions (contrast adjustment, glare reduction) if possible
-  - Improve formatting of README and documentation in general.  
-  - Make more improvements to organization if possible.   
+  - ~~Figure out why GPU training hangs~~ (FIXED 2/19)
+  - ~~Add more IP functions~~ CLAHE added (3/4), more to come
+  - Web server integration and polishing
+  - More testing for Iteration 2 CNN — full evaluation on larger/different datasets
+  - Improve formatting of README and documentation in general
+  - Make more improvements to organization if possible
+  - Consider: seal-specific features beyond haze detection (species classification is a reach goal)
 
 ## Dataset Setup
 
@@ -150,6 +195,13 @@ cargo run -p ai-model -- --dehaze path/to/image.jpg
 # Usage: --dehaze-custom FILE omega t0 patch_size guided_radius guided_eps
 cargo run -p ai-model -- --dehaze-custom image.jpg 0.75 0.25 15 15 0.0001
 
+# Enhance contrast with CLAHE (default parameters: 8x8 grid, clip_limit=2.5)
+cargo run -p ai-model -- --clahe path/to/image.jpg
+
+# Enhance contrast with custom CLAHE parameters
+# Usage: --clahe-custom FILE grid_h grid_w clip_limit
+cargo run -p ai-model -- --clahe-custom image.jpg 8 8 4.0
+
 # Show help
 cargo run -p ai-model -- --help
 ```
@@ -182,16 +234,16 @@ cargo run -p ai-model -- --train-cnn-save cnn_model
 cargo run -p ai-model -- --process-cnn cnn_model "dataset/SealID/full images/source_query/input.jpg" output.jpg
 ```
 
-#### GPU Training (fast, recommended - but currently broken, see Known Issues)
+#### GPU Training (fast, recommended)
 ```bash
-# Step 1: Train and save CNN on GPU (do this once - much faster... but not working right now, see Known Issues)
+# Step 1: Train and save CNN on GPU (do this once - much faster)
 cargo run -p ai-model --release -- --train-cnn-gpu-save cnn_model
 
 # Step 2: Process new images with saved CNN model on GPU
 cargo run -p ai-model --release -- --process-cnn-gpu cnn_model "dataset/SealID/full images/source_query/input.jpg" output.jpg
 ```
 
-**WARNING:** GPU training currently hangs at first epoch for images > 256x256. See Known Issues section at top of README for the full debugging saga. CPU training works but is slow beyond practicality for testing/validation/comparison or production use. 
+Note: Images larger than 400K pixels (~630×630) are automatically tiled into ~350×350 patches during training so all images contribute. See GPU Training Journey section for details.
 
 Note: CNN models use `.mpk` format (MessagePack binary) instead of JSON for efficiency. GPU training uses dimension-grouped batching where images of the same dimensions are batched together for processing in parallel which massively improves GPU utilization compared to one-image-at-a-time processing that was causing the GPU to spike once at initialization then sit idle, though other issues are still blocking GPU training, see Known Issues section at top of README.
 
@@ -202,6 +254,11 @@ Note: CNN models use `.mpk` format (MessagePack binary) instead of JSON for effi
 - `guided_radius`: Guided filter radius, larger = smoother (default: 60)
 - `guided_eps`: Guided filter epsilon, smaller = sharper edges (default: 0.0001)
 
+#### Custom CLAHE Parameters
+- `grid_h`: Number of tile rows, more = more local contrast (default: 8)
+- `grid_w`: Number of tile columns (default: 8)
+- `clip_limit`: Contrast limit multiplier, higher = stronger enhancement (default: 2.5, typical range: 1.5–4.0)
+
 ### Running Tests
 ```bash
 cargo test -p ai-model
@@ -210,10 +267,16 @@ cargo test -p IP_functions
 
 ## Image Processing
 
-- Dark Channel Prior is implemented for haze detection. Specifics are explained in comments and in the project plan.  
-  - DCP-based dehazing is now implemented (12/21). Works rather well.
+- **Dark Channel Prior (DCP)** is implemented for haze detection and dehazing. Specifics are explained in comments and in the project plan.  
+  - DCP-based dehazing is implemented (12/21) and works well.
+  - Pipeline: Dark Channel → Atmospheric Light Estimation → Transmission Map → Guided Filter Refinement → Radiance Recovery
+- **CLAHE (Contrast Limited Adaptive Histogram Equalization)** is implemented for local contrast enhancement (3/4/2026).
+  - Divides image into tiles, equalizes histogram per tile with a contrast clip limit, then bilinearly interpolates between tiles for smooth output
+  - Particularly useful for seal photos where the subject (dark seal) is against a bright hazy background — enhances fur texture and body detail without blowing out the background
+  - Applied per-channel in RGB space (simple and effective; LAB color space version is a possible future enhancement)
+  - Default: 8×8 grid, clip limit 2.5; customizable via CLI
 - TODO:  
-  - Other functions still need to be implemented, especially for contrast adjustment and glare reduction. Note that these are optional per the project plan for Sprint 3 (ending 12/26).
+  - More IP functions: white balance correction, unsharp masking/sharpening, noise reduction
   - Reorganize code and file structure
 
 ## Machine Learning
@@ -225,7 +288,7 @@ cargo test -p IP_functions
     - Model persistence implemented (1/29) - save/load trained models to JSON files as per proposer's intention and for overhead/usability reasons
     - Manual query feature implemented (1/29) - --process command loads saved model and dehazes new images with auto-selected parameters (still a basic heuristic, may need to use CNN for better results)
 
-- Iteration 2 (WIP): Convolutional Neural Network implemented as a **haze predictor** (outputs predicted haze score) that **accepts variable image sizes** with a placeholder for DCP parameter recommendations.
+- Iteration 2 (GPU Training Working): Convolutional Neural Network implemented as a **haze predictor** (outputs predicted haze score) that **accepts variable image sizes** with a placeholder for DCP parameter recommendations.
   - Architecture: 4 convolutional layers with strided downsampling → Global Average Pooling→ Fully Connected layers -> Sigmoid Function to normalize haze output to [0,1]
   - Uses DCP-derived features: mean dark channel, transmission stats (WIP), atmospheric intensity (WIP)
   - Also trained on SealID dataset for comparison purposes.
@@ -233,16 +296,16 @@ cargo test -p IP_functions
   - Model persistence implemented (1/31) - save/load trained CNN models to .mpk files
   - Manual query feature implemented (1/31) - --process-cnn command loads saved model and dehazes new images
   - GPU acceleration implemented (2/3) - wgpu backend with dimension-grouped batching
-  - **GPU TRAINING BROKEN (2/11)** - hangs at first epoch for images > 256x256, see Known Issues section for the full two-week debugging saga that ended with me giving up and pushing to GitHub
-  - STATUS: WIP. CPU training works but slow. GPU training hangs on backward pass for larger images.
+  - **GPU TRAINING FIXED (2/19-25)** - required burn upgrade, fusion flush via `into_scalar()`, autodiff graph detachment via `fork()`, and image tiling for oversized images. See GPU Training Journey section.
+  - **Training Results:** ~0.002 MSE on training set, ~0.003 MSE on test set, ~2.7 hours for 50 epochs on RTX 3070
+  - STATUS: Working. GPU training stable. Images >400K pixels are automatically tiled.
   - TODO: 
-    - **FIX GPU TRAINING** (or just resize everything to 256x256 and accept some accuracy issues)
     - SIGNIFICANT TESTING
       - Architecture adjustments based on testing results?
     - Optimization for lower end machines
-    - Further improvements to organization after fixing GPU training
+    - Further improvements to organization after testing
     - Robustness and organization changes due to AI-generated code in some medium-importance functions (detailed in CNN implementation)
-    - Full dataset training evaluation on better hardware (stuck on RTX 3070 machine due to the above issue)
+    - Evaluate whether tiling vs downscaling vs other approaches give better accuracy for large images
   - Papers and Documentation Referenced:
     - burn documentation: https://docs.rs/burn/latest/burn/
       - burn was used due to its flexibility, efficiency, safety/robustness, and wide backend support.
@@ -256,3 +319,5 @@ cargo test -p IP_functions
     - Papers on prior use of CNN's for haze detection and DCP-based dehazing (both accessed via ASU Library):
       - Wu, J., Liu, Z., Huang, F. et al. Adaptive haze pixel intensity perception transformer structure for image dehazing networks. Sci Rep 14, 22435 (2024). https://doi.org/10.1038/s41598-024-73866-y
       - Fazlali, H., Shirani, S., McDonald, M. et al. Cloud/haze detection in airborne videos using a convolutional neural network. Multimed Tools Appl 79, 28587–28601 (2020). https://doi.org/10.1007/s11042-020-09359-7
+    - CLAHE reference:
+      - Zuiderveld, K. "Contrast Limited Adaptive Histogram Equalization." Graphics Gems IV, Academic Press, 1994, pp. 474–485.

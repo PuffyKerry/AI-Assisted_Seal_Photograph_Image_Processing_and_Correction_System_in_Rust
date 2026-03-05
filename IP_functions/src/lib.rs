@@ -4,3 +4,5 @@ pub mod transmission;
 pub mod radiance;
 pub mod guided_filter;
 pub mod dehaze;
+pub mod clahe;
+pub mod enhance;

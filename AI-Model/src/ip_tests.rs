@@ -5,6 +5,7 @@
 use image::{DynamicImage, GenericImageView, RgbImage, Rgb};
 use ndarray::Array3;
 use IP_functions::dehaze::{dehaze_default_parameters_test, dehaze_static_test, dehaze_with_params};
+use IP_functions::enhance::{enhance_clahe_default, enhance_clahe};
 
 //convert input image in DynamicImage format to a 3D array of pixel RGB values for DCP. Moved from main.rs
 pub fn image_to_array3(img: &DynamicImage) -> Array3<f32> {
@@ -44,7 +45,7 @@ pub fn array3_to_image(matrix: &Array3<f32>) -> RgbImage {
 pub fn run_all_ip_tests() { //used ai to collate the testing I did manually earlier
     println!("\n========================================");
     println!("  Image Processing Engine Test Suite");
-    println!("  DCP Dehazing Manual Testing");
+    println!("  DCP Dehazing + CLAHE Enhancement Manual Testing");
     println!("========================================\n");
 
     //Test images - three test images for manual evaluation
@@ -53,6 +54,8 @@ pub fn run_all_ip_tests() { //used ai to collate the testing I did manually earl
     for img_path in test_images.iter() {
         run_single_image_tests(img_path);
         println!(); //spacing between image tests
+        run_clahe_tests(img_path);
+        println!();
     }
 
     println!("========================================");
@@ -154,6 +157,114 @@ pub fn run_quick_test() { //original test I wrote in main.rs that was kept for r
         .expect("Failed to save");
 
     println!("Saved result to output_dehazing_dcp_default_params_fog-137794231410y.jpg");
+}
+
+
+/// Run CLAHE contrast enhancement tests on a single image with default and custom parameters
+fn run_clahe_tests(img_path: &str) {
+    println!("------------------------------------------");
+    println!("CLAHE Enhancement: {}", img_path);
+    println!("------------------------------------------");
+
+    let base_name = img_path.trim_end_matches(".jpg").trim_end_matches(".png");
+
+    let img = match image::open(img_path) {
+        Ok(img) => img,
+        Err(e) => {
+            println!("Failed to open image {}: {}", img_path, e);
+            return;
+        }
+    };
+
+    let img_matrix = image_to_array3(&img);
+
+    //Test 1: Default CLAHE parameters (8x8 grid, clip_limit 2.5)
+    println!("\n--- CLAHE Test 1: Default Parameters ---");
+    println!("Parameters: grid=8x8, clip_limit=2.5");
+
+    let enhanced_default = enhance_clahe_default(&img_matrix);
+    let output_default = format!("output_clahe_default_{}.jpg", base_name);
+    let output_img = array3_to_image(&enhanced_default);
+    output_img.save(&output_default).expect("Failed to save");
+    println!("Saved result to {}", output_default);
+
+    //Test 2: Stronger CLAHE for heavily hazy images
+    println!("\n--- CLAHE Test 2: Strong Parameters ---");
+    println!("Parameters: grid=8x8, clip_limit=4.0");
+
+    let enhanced_strong = enhance_clahe(&img_matrix, 8, 8, 4.0);
+    let output_strong = format!("output_clahe_strong_{}.jpg", base_name);
+    let output_img_strong = array3_to_image(&enhanced_strong);
+    output_img_strong.save(&output_strong).expect("Failed to save");
+    println!("Saved result to {}", output_strong);
+
+    //Test 3: Gentle CLAHE for images that just need a little pop
+    println!("\n--- CLAHE Test 3: Gentle Parameters ---");
+    println!("Parameters: grid=4x4, clip_limit=1.5");
+
+    let enhanced_gentle = enhance_clahe(&img_matrix, 4, 4, 1.5);
+    let output_gentle = format!("output_clahe_gentle_{}.jpg", base_name);
+    let output_img_gentle = array3_to_image(&enhanced_gentle);
+    output_img_gentle.save(&output_gentle).expect("Failed to save");
+    println!("Saved result to {}", output_gentle);
+}
+
+
+/// Apply CLAHE to a single image from command line — called from main.rs via --clahe flag
+pub fn clahe_single_image(img_path: &str) {
+    println!("=== CLAHE Contrast Enhancement: {} ===\n", img_path);
+
+    let img = match image::open(img_path) {
+        Ok(img) => img,
+        Err(e) => {
+            println!("Error: Failed to open image: {}", e);
+            return;
+        }
+    };
+
+    let img_matrix = image_to_array3(&img);
+    println!("Image loaded: {}x{}", img.width(), img.height());
+    println!("Running CLAHE with default parameters (8x8 grid, clip_limit=2.5)...\n");
+
+    let enhanced = enhance_clahe_default(&img_matrix);
+
+    let input_path = std::path::Path::new(img_path);
+    let stem = input_path.file_stem().unwrap_or_default().to_str().unwrap_or("output");
+    let output_path = format!("output_clahe_{}.jpg", stem);
+
+    let output_img = array3_to_image(&enhanced);
+    output_img.save(&output_path).expect("Failed to save");
+    println!("Saved enhanced result to {}", output_path);
+}
+
+
+/// Apply CLAHE to a single image with custom parameters — called from main.rs via --clahe-custom flag
+pub fn clahe_with_custom_params(img_path: &str, grid_h: usize, grid_w: usize, clip_limit: f32) {
+    println!("=== CLAHE Contrast Enhancement with Custom Parameters ===");
+    println!("Image: {}", img_path);
+    println!("Parameters: grid={}x{}, clip_limit={}\n", grid_h, grid_w, clip_limit);
+
+    let img = match image::open(img_path) {
+        Ok(img) => img,
+        Err(e) => {
+            println!("Error: Failed to open image: {}", e);
+            return;
+        }
+    };
+
+    let img_matrix = image_to_array3(&img);
+    println!("Image loaded: {}x{}", img.width(), img.height());
+    println!("Running CLAHE...\n");
+
+    let enhanced = enhance_clahe(&img_matrix, grid_h, grid_w, clip_limit);
+
+    let input_path = std::path::Path::new(img_path);
+    let stem = input_path.file_stem().unwrap_or_default().to_str().unwrap_or("output");
+    let output_path = format!("output_clahe_custom_{}.jpg", stem);
+
+    let output_img = array3_to_image(&enhanced);
+    output_img.save(&output_path).expect("Failed to save");
+    println!("Saved enhanced result to {}", output_path);
 }
 
 #[cfg(test)]

@@ -474,6 +474,49 @@ pub fn resize_images_to_common_size(images: &[Array3<f32>], target_size: (usize,
 
 
 /*
+Tile a single oversized image into smaller non-overlapping patches that fit within the
+GPU VRAM pixel budget, so every image in the dataset contributes to training instead of
+being skipped.  Each tile inherits the parent image's haze label because haze is a
+scene-wide property that affects all regions roughly equally.
+
+Strategy: split into a grid of tiles where each tile is at most `max_tile` pixels on a
+side (default ~350).  If the image doesn't divide evenly the rightmost / bottommost tiles
+simply cover whatever remains, so no pixels are lost.  Tiles smaller than 16×16 (the
+network's minimum) are dropped.
+
+@param img: oversized image as Array3<f32> [H, W, 3]
+@param max_tile: maximum tile side length in pixels (default 350 keeps tiles ≈122 K px,
+       well within the 400 K limit even with some padding from the conv layers)
+@return: Vec of tile images, each Array3<f32>
+*/
+fn tile_large_image(img: &Array3<f32>, max_tile: usize) -> Vec<Array3<f32>> {
+    let (h, w, _c) = img.dim();
+    let mut tiles = Vec::new();
+
+    let mut y = 0usize;
+    while y < h {
+        let tile_h = max_tile.min(h - y);
+        if tile_h < 16 { break; } // too small for the network
+
+        let mut x = 0usize;
+        while x < w {
+            let tile_w = max_tile.min(w - x);
+            if tile_w < 16 { x += max_tile; continue; }
+
+            // extract tile via ndarray slicing
+            let tile = img.slice(ndarray::s![y..y+tile_h, x..x+tile_w, ..]).to_owned();
+            tiles.push(tile);
+
+            x += max_tile;
+        }
+        y += max_tile;
+    }
+
+    tiles
+}
+
+
+/*
 Mean Squared Error loss for regression training.
 MSE = mean((predictions - targets)^2) (also used in Iteration 1)
 
@@ -515,24 +558,61 @@ where
     assert_eq!(train_images.len(), train_labels.len(), "Images and labels must have same length");
     let num_samples = train_images.len();
 
-    //Group images by dimensions (exact match) for batching, which is how optimization for GPU utilization works
-    let dimension_groups = group_images_by_dimensions(train_images, train_labels);
+    // === Tile oversized images so nothing is skipped ===
+    // Any image whose pixel count exceeds the backward-pass VRAM budget (400 K px)
+    // is sliced into non-overlapping ~350×350 tiles that stay safely under the limit.
+    // Each tile inherits the parent image's haze label (haze is scene-wide).
+    const MAX_PIXELS: usize = 400_000;
+    const TILE_SIDE: usize = 350; // 350×350 = 122 500 px, well within budget
+
+    let mut tiled_images: Vec<Array3<f32>> = Vec::new();
+    let mut tiled_labels: Vec<f64> = Vec::new();
+    let mut tiles_created: usize = 0;
+    let mut images_tiled: usize = 0;
+
+    for (img, &label) in train_images.iter().zip(train_labels.iter()) {
+        let (h, w, _) = img.dim();
+        if h * w > MAX_PIXELS {
+            // Image too large for a single backward pass — tile it
+            let tiles = tile_large_image(img, TILE_SIDE);
+            tiles_created += tiles.len();
+            images_tiled += 1;
+            for tile in tiles {
+                tiled_images.push(tile);
+                tiled_labels.push(label);
+            }
+        } else {
+            // Fits in VRAM as-is
+            tiled_images.push(img.clone());
+            tiled_labels.push(label);
+        }
+    }
+
+    if images_tiled > 0 {
+        println!("Tiled {} oversized images into {} tiles ({}×{} max tile size)",
+            images_tiled, tiles_created, TILE_SIDE, TILE_SIDE);
+        io::stdout().flush().unwrap();
+    }
+
+    //Group images by dimensions (exact match) for batching
+    let dimension_groups = group_images_by_dimensions(&tiled_images, &tiled_labels);
     let num_groups = dimension_groups.len();
     let valid_samples: usize = dimension_groups.values().map(|v| v.len()).sum();
 
     println!("=== CNN Training Started ===");
-    println!("Training samples: {} ({} valid after size filter)", num_samples, valid_samples);
+    println!("Original samples: {}, after tiling: {} ({} valid after size filter)",
+        num_samples, tiled_images.len(), valid_samples);
     println!("Dimension groups: {} (images grouped by size for batching)", num_groups);
     println!("Batch size: {} (max images per GPU batch)", batch_size);
     println!("Epochs: {}, Learning rate: {}", epochs, learning_rate);
     println!();
     io::stdout().flush().unwrap();
 
-    //Print dimension group distribution for debugging
+    //Print dimension group distribution
     let mut group_sizes: Vec<_> = dimension_groups.iter()
         .map(|((h, w), imgs)| (*h, *w, imgs.len()))
         .collect();
-    group_sizes.sort_by(|a, b| b.2.cmp(&a.2)); //sort by count descending
+    group_sizes.sort_by(|a, b| b.2.cmp(&a.2));
     println!("Top dimension groups (HxW: count):");
     for (h, w, count) in group_sizes.iter().take(5) {
         println!("  {}x{}: {} images", h, w, count);
@@ -543,15 +623,10 @@ where
     println!();
     io::stdout().flush().unwrap();
 
-    //Adam optimizer for adaptive learning rate per parameter
     let optimizer_config = AdamConfig::new();
     let mut optimizer = optimizer_config.init();
-
     let mut current_model = model;
     let training_start = Instant::now();
-
-    println!("NOTE: First batch will be slow due to GPU shader compilation (one-time cost)");
-    io::stdout().flush().unwrap();
 
     for epoch in 0..epochs {
         let epoch_start = Instant::now();
@@ -565,46 +640,29 @@ where
         let mut group_idx = 0usize;
         let total_groups = dimension_groups.len();
 
-        //Process each dimension group
         for ((_h, _w), group) in dimension_groups.iter() {
             group_idx += 1;
-            //Skip very small images that would collapse to nothing after 4 stride-2 convolutions
-            if _h < &16 || _w < &16 {
-                continue;
-            }
+            if _h < &16 || _w < &16 { continue; }
 
-            //Calculate adaptive batch size based on image dimensions to avoid GPU OOM
-            //Larger images need smaller batches to fit in VRAM
-            //RTX 3070 has 8GB VRAM, estimate ~20MB per 1024x1024 image in training with gradients
             let pixels = _h * _w;
-            let adaptive_batch_size = if pixels > 800_000 {
-                //Large images (>~900x900): process one at a time to avoid OOM
-                1
-            } else if pixels > 400_000 {
-                //Medium-large images (~600x600 to ~900x900): small batches
-                2.min(batch_size)
-            } else if pixels > 200_000 {
-                //Medium images (~450x450 to ~600x600): moderate batches
-                4.min(batch_size)
-            } else if pixels > 100_000 {
-                //Small-medium images (~300x300 to ~450x450): larger batches
-                8.min(batch_size)
-            } else {
-                //Small images (<~300x300): full batch size
-                batch_size
-            };
 
-            //Split group into batches of adaptive_batch_size
+
+            //Adaptive batch size to avoid OOM on larger images
+            //Smaller batches for large images keep peak GPU memory in check
+            let adaptive_batch_size = if pixels > 250_000 { 1 }
+                else if pixels > 150_000 { 2.min(batch_size) }
+                else if pixels > 100_000 { 4.min(batch_size) }
+                else if pixels > 50_000 { 8.min(batch_size) }
+                else { batch_size };
+
             let group_batches: Vec<_> = group.chunks(adaptive_batch_size).collect();
-            let num_batches_in_group = group_batches.len();
+            let num_batches = group_batches.len();
 
             for (batch_idx, batch_chunk) in group_batches.into_iter().enumerate() {
                 let batch_start = Instant::now();
-
-                //Print BEFORE processing so user sees immediate feedback
-                println!("  Grp {}/{} ({}x{}) | Batch {}/{} | {}/{} ({:.1}%) | Starting...",
-                    group_idx, total_groups, _h, _w,
-                    batch_idx + 1, num_batches_in_group,
+                print!("  Grp {}/{} ({}x{}, {}px) | Batch {}/{} | {}/{} ({:.1}%) | ",
+                    group_idx, total_groups, _h, _w, pixels,
+                    batch_idx + 1, num_batches,
                     processed_images, valid_samples,
                     (processed_images as f32 / valid_samples as f32) * 100.0);
                 io::stdout().flush().unwrap();
@@ -613,39 +671,43 @@ where
                 let batch_labels: Vec<f32> = batch_chunk.iter().map(|(_, _, lbl)| *lbl as f32).collect();
                 let current_batch_size = batch_images.len();
 
-                //Convert batch of ndarray images to tensors
-                let image_tensor = images_to_batched_tensor::<B>(&batch_images, device);
-                let label_tensor = Tensor::<B, 1>::from_floats(batch_labels.as_slice(), device)
-                    .reshape([current_batch_size, 1]);
+                //--- Forward pass and loss in a block so tensors are dropped before next batch ---
+                let (loss_value, grads_params) = {
+                    let image_tensor = images_to_batched_tensor::<B>(&batch_images, device);
+                    let label_tensor = Tensor::<B, 1>::from_floats(batch_labels.as_slice(), device)
+                        .reshape([current_batch_size, 1]);
 
-                //Forward pass (making the prediction): batch of images -> batch of haze score predictions
-                let predictions = current_model.forward(image_tensor);
+                    let predictions = current_model.forward(image_tensor);
+                    let loss = mse_loss(predictions, label_tensor);
 
-                //Compute MSE loss between prediction and ground truth for the batch
-                let loss = mse_loss(predictions, label_tensor);
-                let loss_value: f32 = loss.clone().into_scalar().elem();
-                epoch_loss += loss_value * current_batch_size as f32; //weight by batch size for proper averaging
+                    //CRITICAL: into_scalar() forces fusion backend flush BEFORE backward
+                    let lv: f32 = loss.clone().into_scalar().elem();
 
-                //Backward pass (learn based on prediction error):: compute gradients and update weights
-                let grads = loss.backward();
+                    let grads = loss.backward();
+                    let gp = GradientsParams::from_grads(grads, &current_model);
+                    (lv, gp)
+                    //image_tensor, label_tensor, predictions, loss all dropped here — frees GPU memory
+                };
 
-                let grads_params = GradientsParams::from_grads(grads, &current_model);
+                epoch_loss += loss_value * current_batch_size as f32;
                 current_model = optimizer.step(learning_rate, current_model, grads_params);
+
+                //Detach the autodiff graph so gradient history from this batch doesn't
+                //accumulate in GPU memory across future batches. fork() creates a fresh
+                //copy of the model with its own autodiff graph, freeing the old one.
+                current_model = current_model.fork(device);
 
                 processed_images += current_batch_size;
                 batch_count += 1;
 
-                //Print completion with timing
-                let batch_duration = batch_start.elapsed();
-                println!("    -> Done in {:?}, Loss: {:.6}", batch_duration, loss_value);
+                println!("Done {:?}, Loss: {:.6}", batch_start.elapsed(), loss_value);
                 io::stdout().flush().unwrap();
             }
         }
 
-        //Print epoch summary with timing (clear line first with spaces to overwrite progress)
         let avg_loss = if processed_images > 0 { epoch_loss / processed_images as f32 } else { 0.0 };
         let epoch_duration = epoch_start.elapsed();
-        println!("\rEpoch {}/{} complete: {:?}, {} batches, {} images, MSE Loss = {:.6}                    ",
+        println!("Epoch {}/{} complete: {:?}, {} batches, {} images, MSE = {:.6}",
             epoch + 1, epochs, epoch_duration, batch_count, processed_images, avg_loss);
         io::stdout().flush().unwrap();
     }
@@ -681,8 +743,19 @@ pub fn evaluate_cnn<B: Backend>(
             continue; //skip images too small for the network
         }
 
-        let tensor = image_to_tensor::<B>(img, device);
-        let prediction = model.predict_single(tensor);
+        let prediction = if h * w > 400_000 {
+            // Tile oversized image and average predictions across tiles
+            let tiles = tile_large_image(img, 350);
+            if tiles.is_empty() { continue; }
+            let sum: f32 = tiles.iter().map(|tile| {
+                let tensor = image_to_tensor::<B>(tile, device);
+                model.predict_single(tensor)
+            }).sum();
+            sum / tiles.len() as f32
+        } else {
+            let tensor = image_to_tensor::<B>(img, device);
+            model.predict_single(tensor)
+        };
 
         let error = prediction as f64 - label;
         total_squared_error += error * error;
@@ -698,7 +771,8 @@ pub fn evaluate_cnn<B: Backend>(
 
 
 /* AI-generated function wrapper
-Predict haze score for a single image using trained model
+Predict haze score for a single image using trained model.
+For oversized images (>400K pixels), tiles the image and averages tile predictions.
 
 @param model: trained HazeCNN model
 @param image: input image as Array3<f32>
@@ -709,9 +783,24 @@ pub fn predict_haze_cnn<B: Backend>(
     model: &HazeCNN<B>,
     image: &Array3<f32>,
     device: &B::Device,
-) -> f32 { //AI-generated wrapper
-    let tensor = image_to_tensor::<B>(image, device);
-    model.predict_single(tensor)
+) -> f32 {
+    let (h, w, _) = image.dim();
+    if h * w > 400_000 {
+        // Tile oversized image and average predictions
+        let tiles = tile_large_image(image, 350);
+        if tiles.is_empty() {
+            let tensor = image_to_tensor::<B>(image, device);
+            return model.predict_single(tensor);
+        }
+        let sum: f32 = tiles.iter().map(|tile| {
+            let tensor = image_to_tensor::<B>(tile, device);
+            model.predict_single(tensor)
+        }).sum();
+        sum / tiles.len() as f32
+    } else {
+        let tensor = image_to_tensor::<B>(image, device);
+        model.predict_single(tensor)
+    }
 }
 
 
@@ -902,7 +991,7 @@ pub fn run_cnn_training_gpu<P: AsRef<Path>>(
     println!("=== GPU DIAGNOSTICS ===");
     io::stdout().flush().unwrap();
 
-    let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
+    let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {
         backends: wgpu::Backends::all(),
         ..Default::default()
     });
@@ -942,86 +1031,23 @@ pub fn run_cnn_training_gpu<P: AsRef<Path>>(
     println!("  Warming up GPU with progressively larger images...");
     io::stdout().flush().unwrap();
     let warmup_start = Instant::now();
+    //Warmup: just do a forward pass to compile GPU shaders, NO backward pass
+    //The old warmup called loss.backward() 4 times on the same model without optimizer.step(),
+    //which accumulated dangling gradient graphs on the GPU and corrupted the wgpu command encoder,
+    //causing "Encoder is invalid" panics on the very first training image.
     {
-        /*
-        //Create a small test tensor and do a forward pass to compile shaders
-        let test_data: [f32; 12] = [0.5; 12]; //tiny 2x2x3 image
-        let test_tensor: Tensor<AutodiffGpuBackend, 1> = Tensor::from_floats(&test_data[..], &device);
-        let _reshaped = test_tensor.reshape([1, 3, 2, 2]);
-        //Force sync by reading a value back
-        */
-
         let config = HazeCNNConfig::new();
         let warmup_model = config.init::<AutodiffGpuBackend>(&device);
-        /*
-        let tiny_img = Array3::<f32>::zeros((32, 32, 3));
-        let tiny_tensor = image_to_tensor::<AutodiffGpuBackend>(&tiny_img, &device);
-        let _output = warmup_model.forward(tiny_tensor);
-        println!("    Forward pass compiled in {:?}", warmup_start.elapsed());
+
+        //Single small forward pass to trigger shader compilation
+        let test_img = Array3::<f32>::zeros((64, 64, 3));
+        let test_tensor = image_to_tensor::<AutodiffGpuBackend>(&test_img, &device);
+        let output = warmup_model.forward(test_tensor);
+        //Force GPU sync by reading scalar value back to CPU
+        let _val: f32 = output.reshape([1]).into_scalar().elem();
+        println!("    Forward shader warmup complete");
         io::stdout().flush().unwrap();
-        */
-
-        //Test progressively larger images to find where it breaks
-        let test_sizes = [(32, 32), (64, 64), (128, 128), /*(256, 256),*/ (512, 512)];
-
-        for (h, w) in test_sizes {
-            print!("    Testing {}x{}... ", h, w);
-            io::stdout().flush().unwrap();
-            let size_start = Instant::now();
-
-            let test_img = Array3::<f32>::zeros((h, w, 3));
-            let test_tensor = image_to_tensor::<AutodiffGpuBackend>(&test_img, &device);
-
-            print!("forward... ");
-            io::stdout().flush().unwrap();
-            let output = warmup_model.forward(test_tensor.clone());
-
-            print!("loss... ");
-            io::stdout().flush().unwrap();
-            let target = Tensor::<AutodiffGpuBackend, 1>::from_floats(&[0.5f32][..], &device).reshape([1, 1]);
-            let loss = mse_loss(output, target);
-
-            print!("backward... ");
-            io::stdout().flush().unwrap();
-            let backward_start = Instant::now();
-            print!("vars: {}... ", warmup_model.to_string());
-            //==============================================================================
-            //  ISSUE BELOW BLOCK COMMENT (2/11/2026): This is where training hangs for images > 256x256 (used AI to write summary of issues here from a summary I gave it myself, and then retyped most of it anyways)
-            //
-            //  My debugging journey in a nutshell:
-            //  "stuck on first epoch" -> "GPU not connected?" -> "batching taking time?" -> "still GPU problem??" -> "precompiling shaders?" -> "image sizes?" -> "force sync GPU?"
-            //
-            //  loss.backward() triggers async GPU work for backpropagation. For 256x256 and smaller it works fine. For 512x512 or any image with dimensions > 256 (e.g.  it just... get stuck, forever. The forward pass completes, the loss computes, but backward() never returns.
-            //
-            //  Attempted fixes that didn't work:
-            //  - Force sync via GradientsParams::from_grads() (see below) (makes sure previous image is fully processed and gradients are computed before attempting to move onto the next)
-            //  - drop(grad_params) to trigger cleanup and force sync
-            //  - WGPU_BACKEND="vulkan" environment variable, also tried to set backend to DX12, neither made a difference
-            //  - Making sure DiscreteGpu(0) is selected (the right one, it was)
-            //  - Dimension-grouped batching, and changing the number of groups or the size of batches
-            //  - Granular progress updates in case it was just slow (at least I can see WHERE it hangs now)
-            //
-            //  The issue is somewhere in wgpu/burn shader compilation or execution for larger convolution operations. Help would be appreciated. I am working on this myself in the meantime nevertheless.
-            //==============================================================================
-            let grads = loss.backward(); //cursed line here
-            print!("backward done in {:?}", backward_start.elapsed());
-            let grad_params = GradientsParams::from_grads(grads, &warmup_model); //Force sync by accessing gradient data, this works by forcing the GPU to finish computing gradient data as .backward() is asynchronous, so on paper this should trigger shader compilation and GPU execution for the backward pass, and if it works without OOM or errors then we know the GPU is not having issues with that image size.
-            drop(grad_params);//Drop to ensure GPU work completes as a backup to the above
-
-            println!("done in {:?}", size_start.elapsed());
-            io::stdout().flush().unwrap();
-        }
-        /*
-        //Now do a backward pass to compile those shaders too
-        let backward_start = Instant::now();
-        let tiny_tensor2 = image_to_tensor::<AutodiffGpuBackend>(&tiny_img, &device);
-        let output2 = warmup_model.forward(tiny_tensor2);
-        let target = Tensor::<AutodiffGpuBackend, 1>::from_floats(&[0.5f32][..], &device).reshape([1, 1]);
-        let loss = mse_loss(output2, target);
-        let _grads = loss.backward();
-        println!("    Backward pass compiled in {:?}", backward_start.elapsed());
-        io::stdout().flush().unwrap();
-         */
+        //warmup_model and all tensors dropped here — GPU memory clean
     }
 
     println!("  GPU warmup complete in {:?}", warmup_start.elapsed());
