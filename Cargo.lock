@@ -6100,6 +6100,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "web_server"
+version = "0.1.0"
+dependencies = [
+ "IP_functions",
+ "base64",
+ "image",
+ "ndarray 0.17.2",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "webpki-roots"
 version = "0.26.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"

@@ -5,17 +5,36 @@
 /dataset/
 /SealID/
 
-# Output images from testing
+# Output images from testing/training
 output_*.jpg
 output_*.png
+output-*.jpg
+output-*.png
+demo_output_*.jpg
+test_output_*.jpg
+*_full_cnn_gpu_tiled.jpg
+*_full_regressor.jpg
+*_epoch_cnn_*.jpg
+*_epoch_regressor.jpg
+
+# Sample/test images copied from dataset
+achuge.jpg
+adpzbb.jpg
+bansui.jpg
+fog-*.jpg
 
 # IDE files
 .idea/
 *.iml
+
+# Trained model files
 *.json
-
-*_full_regressor.jpg
-
-*.txt
-
+!web_server/**/*.json
 *.mpk
+
+# Build/training/debug logs
+*.txt
+!README.md
+
+# Temp files
+git_*_temp.txt

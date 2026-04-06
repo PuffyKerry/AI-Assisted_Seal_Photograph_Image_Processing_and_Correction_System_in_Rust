@@ -109,9 +109,11 @@ use std::{
     fs,
     collections::HashMap,
     io::{self, Write},
-    time::Instant,
+    time::{Instant, Duration},
+    thread,
 };
 use wgpu; //for GPU diagnostics
+use IP_functions::enhance::enhance_clahe; //for CNN input preprocessing
 
 pub const CNN_INPUT_CHANNELS: usize = 3; //RGB image input
 
@@ -157,17 +159,17 @@ Default values are reasonable starting points recommended by AI, can be tuned ba
 #[derive(Config, Debug)]
 pub struct HazeCNNConfig { //defaults were AI-generated
     #[config(default = "16")]
-    conv1_channels: usize,
+    pub conv1_channels: usize,
     #[config(default = "32")]
-    conv2_channels: usize,
+    pub conv2_channels: usize,
     #[config(default = "64")]
-    conv3_channels: usize,
+    pub conv3_channels: usize,
     #[config(default = "128")]
-    conv4_channels: usize,
+    pub conv4_channels: usize,
     #[config(default = "64")]
-    fc1_size: usize,
+    pub fc1_size: usize,
     #[config(default = "0.3")]
-    dropout_rate: f64,
+    pub dropout_rate: f64,
 }
 
 impl HazeCNNConfig {
@@ -205,7 +207,8 @@ impl HazeCNNConfig {
 
         //After GAP: [batch, conv4_channels, 1, 1] -> flatten to [batch, conv4_channels] so that fully connected layers can handle arbitrary spatial sizes
         let fc1 = LinearConfig::new(self.conv4_channels, self.fc1_size).init(device);
-        let fc2 = LinearConfig::new(self.fc1_size, 1).init(device);
+        //Output 3 values: [DCP haze score, CLAHE contrast deficit, brightness deficit] all in [0, 1]
+        let fc2 = LinearConfig::new(self.fc1_size, 3).init(device);
 
         let dropout = DropoutConfig::new(self.dropout_rate).init();
         let activation = Relu::new();
@@ -262,15 +265,15 @@ impl<B: Backend> HazeCNN<B> {
     }
 
     /*
-    Convenient wrapper for predicting haze of a single image
+    Wrapper for predicting all three scores for a single image.
 
-    @param image: input tensor of shape [1, 3, H, W] (single image batch)
-    @return: haze score as f32 in [0, 1]
+    @param image: input tensor of shape [1, 3, H, W]
+    @return: (dcp_haze_score, clahe_contrast_deficit, brightness_deficit) all in [0, 1] as f32's
     */
-    pub fn predict_single(&self, image: Tensor<B, 4>) -> f32 {
-        let output = self.forward(image);
+    pub fn predict_triple(&self, image: Tensor<B, 4>) -> (f32, f32, f32) {
+        let output: Tensor<B,2> = self.forward(image); // vector of [dcp_haze_score, clahe_contrast_deficit, brightness_deficit]
         let output_data: Vec<f32> = output.to_data().to_vec().unwrap();
-        output_data[0]
+        (output_data[0], output_data[1], output_data[2])
     }
 
     /*
@@ -346,6 +349,29 @@ pub fn image_to_tensor<B: Backend>(img: &Array3<f32>, device: &B::Device) -> Ten
 }
 
 
+// CLAHE parameters used for CNN input normalisation (NOT output enhancement).
+// Mild, fixed params — purpose is to normalise baseline contrast so the CNN focuses on
+// haze patterns rather than raw exposure/lighting differences between images.
+const CNN_PREPROCESS_CLAHE_GRID: usize = 8;  // 8×8 tile grid
+const CNN_PREPROCESS_CLAHE_CLIP: f32  = 2.0; // moderate contrast limit
+
+/*
+Apply CLAHE preprocessing to a single image before it enters the CNN, both for training
+and inference.  This normalises local contrast across images so the network learns to
+recognise haze from pixel patterns rather than absolute brightness levels.
+
+IMPORTANT: must be applied identically at training time and inference time.  If this
+preprocessing is ever changed, the saved model weights become invalid and training
+must be restarted.
+
+@param img: input image Array3<f32> [H, W, 3] with values in [0, 1]
+@return: CLAHE-normalised image with the same shape
+*/
+pub fn preprocess_for_cnn(img: &Array3<f32>) -> Array3<f32> {
+    enhance_clahe(img, CNN_PREPROCESS_CLAHE_GRID, CNN_PREPROCESS_CLAHE_GRID, CNN_PREPROCESS_CLAHE_CLIP)
+}
+
+
 /*
 Group images by their dimensions so we can batch them together for GPU efficiency, since images with the same dimensions can be stacked into a single tensor and processed in parallel which massively improves GPU utilization compared to one-image-at-a-time processing.
 Returns a HashMap where keys are (height, width) tuples and values are vectors of (index, image, label) tuples so we can track which images are in each group.
@@ -356,9 +382,9 @@ Returns a HashMap where keys are (height, width) tuples and values are vectors o
 */
 fn group_images_by_dimensions<'a>(
     images: &'a [Array3<f32>],
-    labels: &'a [f64],
-) -> HashMap<(usize, usize), Vec<(usize, &'a Array3<f32>, f64)>> {
-    let mut groups: HashMap<(usize, usize), Vec<(usize, &'a Array3<f32>, f64)>> = HashMap::new();
+    labels: &'a [(f64, f64, f64)],
+) -> HashMap<(usize, usize), Vec<(usize, &'a Array3<f32>, (f64, f64, f64))>> {
+    let mut groups: HashMap<(usize, usize), Vec<(usize, &'a Array3<f32>, (f64, f64, f64))>> = HashMap::new();
 
     for (idx, (img, &label)) in images.iter().zip(labels.iter()).enumerate() {
         let (h, w, _) = img.dim();
@@ -541,40 +567,62 @@ Train the CNN on a set of images and labels using dimension-grouped batching for
 @param learning_rate: Adam optimizer learning rate (Adam is a gradient descent optimization (basically optimization algorithm for the learning rate) with adaptive (adjusts learning rate during runtime) learning rate per parameter, using simple math)
 @param batch_size: max images per batch (images of same dimensions are grouped, then split into chunks of this size)
 @param device: burn backend device
+@param gpu_throttle_ms: milliseconds to sleep after each batch to avoid hogging the GPU (0 = no throttle, 10-50 = good for working while training)
+@param model_memory_scale: VRAM scaling factor for different model sizes relative to the default 128-channel architecture (e.g. 0.5 for Small 64ch, 1.0 for Medium, 2.0 for Large 256ch). Clamped to min 1.0 internally — smaller models still use the baseline budget since GPU VRAM is the bottleneck, not model size. Only makes tiling/batching MORE conservative for larger-than-default models.
 @return: trained HazeCNN model
 */
 pub fn train_cnn<B: Backend>(
     model: HazeCNN<B>,
     train_images: &[Array3<f32>],
-    train_labels: &[f64],
+    train_dcp_labels: &[f64],
+    train_clahe_labels: &[f64],
+    train_brightness_labels: &[f64],
     epochs: usize,
     learning_rate: f64,
     batch_size: usize,
     device: &B::Device,
+    gpu_throttle_ms: u64,
+    model_memory_scale: f64,
 ) -> HazeCNN<B>
 where
     B: AutodiffBackend,
 {
-    assert_eq!(train_images.len(), train_labels.len(), "Images and labels must have same length");
+    assert_eq!(train_images.len(), train_dcp_labels.len(), "Images and DCP labels must have same length");
+    assert_eq!(train_images.len(), train_clahe_labels.len(), "Images and CLAHE labels must have same length");
+    assert_eq!(train_images.len(), train_brightness_labels.len(), "Images and brightness labels must have same length");
     let num_samples = train_images.len();
 
+    // Zip DCP + CLAHE + brightness labels into a single Vec<(f64, f64, f64)> for grouping machinery
+    let combined_labels: Vec<(f64, f64, f64)> = train_dcp_labels.iter()
+        .zip(train_clahe_labels.iter())
+        .zip(train_brightness_labels.iter())
+        .map(|((&d, &c), &b)| (d, c, b))
+        .collect();
+
     // === Tile oversized images so nothing is skipped ===
-    // Any image whose pixel count exceeds the backward-pass VRAM budget (400 K px)
-    // is sliced into non-overlapping ~350×350 tiles that stay safely under the limit.
-    // Each tile inherits the parent image's haze label (haze is scene-wide).
-    const MAX_PIXELS: usize = 400_000;
-    const TILE_SIDE: usize = 350; // 350×350 = 122 500 px, well within budget
+    // Any image exceeding the pixel budget is sliced into non-overlapping tiles.
+    // Each tile inherits the parent's haze label (haze is scene-wide).
+    // Baseline 400K/350 is proven to work for the default 128-channel architecture.
+    // Clamped to min 1.0: only larger-than-default models get stricter budgets.
+    //   Small/Medium (scale ≤ 1.0 → 1.0): 400K max, 350px tiles (original values)
+    //   Large        (scale = 2.0):       200K max, 248px tiles
+    let scale = model_memory_scale.max(1.0);
+    let max_pixels: usize = (400_000.0 / scale) as usize;
+    let tile_side: usize = ((350.0 / scale.sqrt()) as usize).max(64);
 
     let mut tiled_images: Vec<Array3<f32>> = Vec::new();
-    let mut tiled_labels: Vec<f64> = Vec::new();
+    let mut tiled_labels: Vec<(f64, f64, f64)> = Vec::new();
     let mut tiles_created: usize = 0;
     let mut images_tiled: usize = 0;
 
-    for (img, &label) in train_images.iter().zip(train_labels.iter()) {
-        let (h, w, _) = img.dim();
-        if h * w > MAX_PIXELS {
+    for (img, &label) in train_images.iter().zip(combined_labels.iter()) {
+        // Apply the same CLAHE preprocessing used at inference time so the CNN
+        // trains on the same distribution it will see when predicting.
+        let preprocessed = preprocess_for_cnn(img);
+        let (h, w, _) = preprocessed.dim();
+        if h * w > max_pixels {
             // Image too large for a single backward pass — tile it
-            let tiles = tile_large_image(img, TILE_SIDE);
+            let tiles = tile_large_image(&preprocessed, tile_side);
             tiles_created += tiles.len();
             images_tiled += 1;
             for tile in tiles {
@@ -583,14 +631,14 @@ where
             }
         } else {
             // Fits in VRAM as-is
-            tiled_images.push(img.clone());
+            tiled_images.push(preprocessed);
             tiled_labels.push(label);
         }
     }
 
     if images_tiled > 0 {
         println!("Tiled {} oversized images into {} tiles ({}×{} max tile size)",
-            images_tiled, tiles_created, TILE_SIDE, TILE_SIDE);
+            images_tiled, tiles_created, tile_side, tile_side);
         io::stdout().flush().unwrap();
     }
 
@@ -605,6 +653,11 @@ where
     println!("Dimension groups: {} (images grouped by size for batching)", num_groups);
     println!("Batch size: {} (max images per GPU batch)", batch_size);
     println!("Epochs: {}, Learning rate: {}", epochs, learning_rate);
+    if gpu_throttle_ms > 0 {
+        println!("GPU throttle: {}ms sleep between batches (training is slower but system stays responsive)", gpu_throttle_ms);
+    } else {
+        println!("GPU throttle: OFF (maximum training speed, system may be less responsive)");
+    }
     println!();
     io::stdout().flush().unwrap();
 
@@ -648,11 +701,12 @@ where
 
 
             //Adaptive batch size to avoid OOM on larger images
-            //Smaller batches for large images keep peak GPU memory in check
-            let adaptive_batch_size = if pixels > 250_000 { 1 }
-                else if pixels > 150_000 { 2.min(batch_size) }
-                else if pixels > 100_000 { 4.min(batch_size) }
-                else if pixels > 50_000 { 8.min(batch_size) }
+            //Pixel count scaled by model_memory_scale so larger models get smaller batches
+            let effective_pixels = (pixels as f64 * scale) as usize;
+            let adaptive_batch_size = if effective_pixels > 250_000 { 1 }
+                else if effective_pixels > 150_000 { 2.min(batch_size) }
+                else if effective_pixels > 100_000 { 4.min(batch_size) }
+                else if effective_pixels > 50_000 { 8.min(batch_size) }
                 else { batch_size };
 
             let group_batches: Vec<_> = group.chunks(adaptive_batch_size).collect();
@@ -668,14 +722,17 @@ where
                 io::stdout().flush().unwrap();
 
                 let batch_images: Vec<&Array3<f32>> = batch_chunk.iter().map(|(_, img, _)| *img).collect();
-                let batch_labels: Vec<f32> = batch_chunk.iter().map(|(_, _, lbl)| *lbl as f32).collect();
+                // Interleave [dcp0, clahe0, bright0, dcp1, clahe1, bright1, ...] so reshape([batch size, 3]) works correctly for triple regression targets
+                let batch_labels_flat: Vec<f32> = batch_chunk.iter()
+                    .flat_map(|(_, _, (dcp, clahe, bright))| [*dcp as f32, *clahe as f32, *bright as f32])
+                    .collect();
                 let current_batch_size = batch_images.len();
 
                 //--- Forward pass and loss in a block so tensors are dropped before next batch ---
                 let (loss_value, grads_params) = {
                     let image_tensor = images_to_batched_tensor::<B>(&batch_images, device);
-                    let label_tensor = Tensor::<B, 1>::from_floats(batch_labels.as_slice(), device)
-                        .reshape([current_batch_size, 1]);
+                    let label_tensor = Tensor::<B, 1>::from_floats(batch_labels_flat.as_slice(), device)
+                        .reshape([current_batch_size, 3]); //[batch, 3]: col0=dcp, col1=clahe, col2=brightness
 
                     let predictions = current_model.forward(image_tensor);
                     let loss = mse_loss(predictions, label_tensor);
@@ -702,6 +759,21 @@ where
 
                 println!("Done {:?}, Loss: {:.6}", batch_start.elapsed(), loss_value);
                 io::stdout().flush().unwrap();
+
+                //Periodic GPU memory flush: every 8 batches, force a GPU pipeline
+                //sync so wgpu's allocator can defragment and reclaim memory.
+                //Without this, long groups (e.g. 69 batches of same-sized tiles)
+                //accumulate fragmented allocations until wgpu panics with OOM.
+                if batch_count % 8 == 0 {
+                    let _sync: f32 = Tensor::<B, 1>::zeros([1], device).into_scalar().elem();
+                }
+
+                //GPU throttle: sleep between batches so the GPU isn't pegged at 100%
+                //and other apps (desktop, browser, presentations) stay responsive.
+                //Set to 0 for maximum training speed, 10-50ms for background training.
+                if gpu_throttle_ms > 0 {
+                    thread::sleep(Duration::from_millis(gpu_throttle_ms));
+                }
             }
         }
 
@@ -731,46 +803,39 @@ Evaluate trained model on a set of images via computing MSE
 pub fn evaluate_cnn<B: Backend>(
     model: &HazeCNN<B>,
     images: &[Array3<f32>],
-    labels: &[f64],
+    dcp_labels: &[f64],
+    clahe_labels: &[f64],
+    brightness_labels: &[f64],
     device: &B::Device,
-) -> f64 { //AI-generated code to simply reimplement previous MSE for linear regression
-    let mut total_squared_error = 0.0;
+) -> (f64, f64, f64) { //returns (dcp_mse, clahe_mse, brightness_mse)
+    let mut dcp_sq_err = 0.0f64;
+    let mut clahe_sq_err = 0.0f64;
+    let mut brightness_sq_err = 0.0f64;
     let mut count = 0;
 
-    for (img, &label) in images.iter().zip(labels.iter()) {
+    for (((img, &dcp_lbl), &clahe_lbl), &bright_lbl)
+    in images.iter().zip(dcp_labels.iter()).zip(clahe_labels.iter()).zip(brightness_labels.iter()) {
         let (h, w, _) = img.dim();
-        if h < 16 || w < 16 {
-            continue; //skip images too small for the network
+        if h < 16 || w < 16 { //skips images too small for the CNN
+            continue;
         }
 
-        let prediction = if h * w > 400_000 {
-            // Tile oversized image and average predictions across tiles
-            let tiles = tile_large_image(img, 350);
-            if tiles.is_empty() { continue; }
-            let sum: f32 = tiles.iter().map(|tile| {
-                let tensor = image_to_tensor::<B>(tile, device);
-                model.predict_single(tensor)
-            }).sum();
-            sum / tiles.len() as f32
-        } else {
-            let tensor = image_to_tensor::<B>(img, device);
-            model.predict_single(tensor)
-        };
-
-        let error = prediction as f64 - label;
-        total_squared_error += error * error;
+        let (dcp_pred, clahe_pred, bright_pred) = predict_haze_cnn(model, img, device);
+        dcp_sq_err += (dcp_pred as f64 - dcp_lbl).powi(2);
+        clahe_sq_err += (clahe_pred as f64 - clahe_lbl).powi(2);
+        brightness_sq_err += (bright_pred as f64 - bright_lbl).powi(2);
         count += 1;
     }
 
     if count > 0 {
-        total_squared_error / count as f64
+        (dcp_sq_err / count as f64, clahe_sq_err / count as f64, brightness_sq_err / count as f64)
     } else {
-        f64::NAN
+        (f64::NAN, f64::NAN, f64::NAN)
     }
 }
 
 
-/* AI-generated function wrapper
+/* AI-generated function wrapper (still need to update docs as of 3/12, less AI generated now)
 Predict haze score for a single image using trained model.
 For oversized images (>400K pixels), tiles the image and averages tile predictions.
 
@@ -783,52 +848,110 @@ pub fn predict_haze_cnn<B: Backend>(
     model: &HazeCNN<B>,
     image: &Array3<f32>,
     device: &B::Device,
-) -> f32 {
-    let (h, w, _) = image.dim();
+) -> (f32, f32, f32) { //(dcp_haze_score, clahe_contrast_deficit, brightness_deficit) all in [0, 1] as f32's
+    // Apply the same CLAHE preprocessing that was used during training
+    let preprocessed = preprocess_for_cnn(image);
+    let (h, w, _) = preprocessed.dim();
     if h * w > 400_000 {
-        // Tile oversized image and average predictions
-        let tiles = tile_large_image(image, 350);
+        // Tile oversized image and average all three predictions across tiles
+        let tiles = tile_large_image(&preprocessed, 350);
         if tiles.is_empty() {
-            let tensor = image_to_tensor::<B>(image, device);
-            return model.predict_single(tensor);
+            let tensor = image_to_tensor::<B>(&preprocessed, device);
+            return model.predict_triple(tensor);
         }
-        let sum: f32 = tiles.iter().map(|tile| {
+        let n = tiles.len() as f32;
+        let (dcp_sum, clahe_sum, bright_sum) = tiles.iter().map(|tile| {
             let tensor = image_to_tensor::<B>(tile, device);
-            model.predict_single(tensor)
-        }).sum();
-        sum / tiles.len() as f32
+            model.predict_triple(tensor)
+        }).fold((0.0f32, 0.0f32, 0.0f32), |(da, ca, ba), (d, c, b)| (da + d, ca + c, ba + b));
+        (dcp_sum / n, clahe_sum / n, bright_sum / n)
     } else {
-        let tensor = image_to_tensor::<B>(image, device);
-        model.predict_single(tensor)
+        let tensor = image_to_tensor::<B>(&preprocessed, device);
+        model.predict_triple(tensor)
     }
 }
 
 
-/* AI-generated PLACEHOLDER heuristic
-Simple PLACEHOLDER heuristic to suggest DCP dehazing parameters based on CNN-predicted haze level. Higher haze scores need more aggressive dehazing (lower omega, higher t0).
-Suggested parameters by haze level:
-    High haze (>0.7): omega=0.65 (remove 35% more haze), t0=0.25, larger guided_radius=20
-    Medium haze (0.4-0.7): omega=0.75 (balanced), t0=0.2, guided_radius=15
-    Low haze (<0.4): omega=0.85 (gentle), t0=0.15, smaller guided_radius=10
+/*
+Continuously-interpolated DCP parameter suggestion based on CNN-predicted haze level.
+Replaces the old 3-bucket step heuristic with smooth linear interpolation so parameters
+change gradually as haze score changes, avoiding sudden jumps at threshold boundaries.
+
+Parameter ranges (low-haze extreme -> high-haze extreme):
+    omega:         0.85 -> 0.65  (less omega = remove more haze)
+    t0:            0.15 -> 0.25  (higher t0 = suppress noise in thick haze)
+    guided_radius: 10   -> 20    (larger radius = smoother transmission map)
+    guided_eps:    0.001 -> 0.0001 (smaller eps = sharper at high haze)
+    patch_size: fixed at 15 (DCP standard)
 
 @param haze_score: predicted haze level from CNN in [0, 1]
 @return: tuple of (omega, t0, patch_size, guided_radius, guided_eps) for dehaze_with_params
 */
-pub fn suggest_dcp_parameters(haze_score: f32) -> (f32, f32, usize, usize, f32) { //Again, VERY MUCH A PLACEHOLDER before more complex parameter recommendations
-    if haze_score > 0.7 {
-        //High haze: aggressive dehazing
-        (0.65, 0.25, 15, 20, 0.0001)
-    } else if haze_score > 0.4 {
-        //Medium haze: balanced parameters
-        (0.75, 0.2, 15, 15, 0.0001)
-    } else {
-        //Low haze: gentle dehazing to avoid artifacts
-        (0.85, 0.15, 15, 10, 0.001)
-    }
+pub fn suggest_dcp_parameters(haze_score: f32) -> (f32, f32, usize, usize, f32) {
+    let h = haze_score.clamp(0.0, 1.0);
+
+    let omega         = 0.85 - 0.20 * h;                         // 0.85 (clear) -> 0.65 (heavy)
+    let t0            = 0.15 + 0.10 * h;                         // 0.15 -> 0.25
+    let patch_size    = 15usize;                                // fixed DCP standard
+    let guided_radius = (10.0_f32 + 10.0 * h).round() as usize; // 10 -> 20
+    let guided_eps    = 0.001_f32 - 0.0009 * h;                  // 0.001 -> 0.0001
+
+    (omega, t0, patch_size, guided_radius, guided_eps)
 }
 
 
-//=============================================================================
+/*
+Continuously-interpolated CLAHE parameter suggestion based on CNN-predicted haze level.
+clip_limit interpolates linearly, the grid steps through 3 levels since integer tile counts
+can't be interpolated sensibly.
+
+Parameter ranges:
+    clip_limit: 1.5 (clear) -> 4.0 (heavy haze), more contrast recovery for hazier images
+    grid:       4×4 (clear) -> 6×6 (mid) -> 8×8 (heavy), more tiles for heavier haze
+
+@param haze_score: predicted haze level from CNN in [0, 1]
+@return: tuple of (grid_h, grid_w, clip_limit) for enhance_clahe()
+*/
+pub fn suggest_clahe_parameters(haze_score: f32) -> (usize, usize, f32) {
+    let h = haze_score.clamp(0.0, 1.0);
+
+    // Reduced from 1.5-4.0 to 1.0-2.5 — old range caused overcorrection especially after DCP
+    let clip_limit = 1.0_f32 + 1.5 * h;  // 1.0 (clear) -> 2.5 (heavy haze)
+    let grid = if h < 0.33 { 4usize } else if h < 0.66 { 6 } else { 8 };
+
+    (grid, grid, clip_limit)
+}
+
+
+/*
+Continuously-interpolated gamma parameter suggestion based on CNN-predicted brightness deficit.
+Higher deficit means the image is further from ideal exposure, needing more correction.
+
+Parameter range:
+    gamma: 1.0 (no deficit, already well-exposed) → 0.4 (high deficit, very dark image)
+
+Note: gamma < 1 brightens, which is the common case for seal photos (dawn, dusk, overcast).
+For overexposed images the deficit score would also be high, but gamma correction in the
+brightening direction still helps because the deficit captures the *magnitude* of correction
+needed, and the gamma formula (from estimate_gamma) automatically handles direction.
+The CNN predicts deficit magnitude; the actual gamma applied at inference time is recomputed
+from the image using estimate_gamma() — the deficit score is used to decide WHETHER and HOW
+AGGRESSIVELY to apply the correction, not the direction.
+
+@param brightness_deficit: predicted brightness deficit from CNN in [0, 1]
+@return: gamma value for brightness_correct()
+*/
+pub fn suggest_gamma_parameters(brightness_deficit: f32) -> f32 {
+    let d = brightness_deficit.clamp(0.0, 1.0);
+
+    // Low deficit (well-exposed) → gamma near 1.0 (minimal change)
+    // High deficit (dark/bright) → gamma near 0.65 (moderate brightening)
+    // Reduced from 0.6 range to 0.35 range — the old 0.4 floor was causing extreme
+    // over-brightening that washed everything out, especially stacked after DCP + CLAHE.
+    // Linear interpolation: 1.0 - 0.35 * deficit
+    let gamma = 1.0 - 0.35 * d;
+    gamma.clamp(0.5, 2.5)
+}
 // High-Level API and Demo Functions
 //=============================================================================
 
@@ -857,9 +980,13 @@ Entry point for training from main.rs via --train-cnn flag.
 */
 pub fn run_cnn_training<P: AsRef<Path>>(
     train_images: &[Array3<f32>],
-    train_labels: &[f64],
+    train_dcp_labels: &[f64],
+    train_clahe_labels: &[f64],
+    train_brightness_labels: &[f64],
     test_images: Option<&[Array3<f32>]>,
-    test_labels: Option<&[f64]>,
+    test_dcp_labels: Option<&[f64]>,
+    test_clahe_labels: Option<&[f64]>,
+    test_brightness_labels: Option<&[f64]>,
     epochs: usize,
     batch_size: usize,
     learning_rate: f64,
@@ -867,10 +994,11 @@ pub fn run_cnn_training<P: AsRef<Path>>(
 ) -> HazeCNN<AutodiffCnnBackend> { //AI generated running code, series of calls to various components
     println!("\n========================================");
     println!("  Iteration 2: CNN Haze Detection");
-    println!("  Variable Input Size Architecture");
+    println!("  Triple-Output: DCP haze score + CLAHE contrast deficit + Brightness deficit");
+    println!("  Variable Input Size Architecture with GPU training");
     println!("========================================\n");
 
-    let device = Cpu; //hard-coding for now, CPU backend for training, will be changed to GPU backend with wgpu in next update to this iteration
+    let device = Cpu; //fallback
     let config = HazeCNNConfig::new();
     let model = config.init::<AutodiffCnnBackend>(&device);
 
@@ -883,37 +1011,49 @@ pub fn run_cnn_training<P: AsRef<Path>>(
     println!("  Conv4: {} -> {} channels, stride 2 (H/16 x W/16)", config.conv3_channels, config.conv4_channels);
     println!("  Global Average Pooling -> {} features", config.conv4_channels);
     println!("  FC1: {} -> {}", config.conv4_channels, config.fc1_size);
-    println!("  FC2: {} -> 1 (haze score)", config.fc1_size);
+    println!("  FC2: {} -> 3 (DCP haze score, CLAHE contrast deficit, brightness deficit)", config.fc1_size);
     println!("  Dropout rate: {}", config.dropout_rate);
     println!();
 
     let trained_model = train_cnn(
         model,
         train_images,
-        train_labels,
+        train_dcp_labels,
+        train_clahe_labels,
+        train_brightness_labels,
         epochs,
         learning_rate,
         batch_size,
         &device,
+        0, //gpu_throttle_ms - CPU path, no throttle needed
+        1.0, //model_memory_scale - default architecture
     );
 
     //Evaluate on test set if provided
-    if let (Some(test_imgs), Some(test_lbls)) = (test_images, test_labels) {
+    if let (Some(test_imgs), Some(test_dcp_lbls), Some(test_clahe_lbls), Some(test_bright_lbls)) =
+        (test_images, test_dcp_labels, test_clahe_labels, test_brightness_labels)
+    {
         println!("\n=== Evaluating on Test Set ===");
-        let mse = evaluate_cnn(&trained_model, test_imgs, test_lbls, &device);
-        println!("Test set MSE: {:.6} \n", mse);
+        let (dcp_mse, clahe_mse, bright_mse) = evaluate_cnn(&trained_model, test_imgs, test_dcp_lbls, test_clahe_lbls, test_bright_lbls, &device);
+        println!("Test set MSE's: DCP: {:.6}, CLAHE: {:.6}, Brightness: {:.6}", dcp_mse, clahe_mse, bright_mse);
 
-        //Show sample predictions with suggested DCP parameters
-        println!("Sample predictions with suggested DCP parameters:");
-        for (i, (img, &label)) in test_imgs.iter().zip(test_lbls.iter()).take(5).enumerate() {
+        println!("\nSample triple predictions for DCP, CLAHE, and brightness:");
+        for (i, (((img, &dcp_lbl), &clahe_lbl), &bright_lbl)) in test_imgs.iter()
+            .zip(test_dcp_lbls.iter())
+            .zip(test_clahe_lbls.iter())
+            .zip(test_bright_lbls.iter())
+            .take(5).enumerate()
+        {
             let (h, w, _) = img.dim();
             if h < 16 || w < 16 { continue; }
-
-            let pred = predict_haze_cnn(&trained_model, img, &device);
-            let (omega, t0, patch, radius, eps) = suggest_dcp_parameters(pred);
-            println!("  Image {}: predicted={:.3}, actual={:.3}", i + 1, pred, label);
-            println!("           -> suggested: omega={}, t0={}, patch={}, radius={}, eps={}",
-                     omega, t0, patch, radius, eps);
+            let (dcp_pred, clahe_pred, bright_pred) = predict_haze_cnn(&trained_model, img, &device);
+            let (omega, t0, patch, radius, eps) = suggest_dcp_parameters(dcp_pred);
+            let (grid_h, grid_w, clip) = suggest_clahe_parameters(clahe_pred);
+            let gamma = suggest_gamma_parameters(bright_pred);
+            println!("  Image {}: DCP pred={:.3}/actual={:.3}  CLAHE pred={:.3}/actual={:.3}  Brightness pred={:.3}/actual={:.3}", i + 1, dcp_pred, dcp_lbl, clahe_pred, clahe_lbl, bright_pred, bright_lbl);
+            println!("           -> DCP:   omega={:.3}, t0={:.3}, patch={}, radius={}, eps={:.5}", omega, t0, patch, radius, eps);
+            println!("           -> CLAHE: grid={}x{}, clip_limit={:.2}", grid_h, grid_w, clip);
+            println!("           -> Gamma: {:.3}", gamma);
         }
     }
     println!("CNN training complete");
@@ -940,21 +1080,27 @@ Note: CPU-only training with burn/ndarray is slow. For production, further testi
 */
 pub fn run_cnn_demo(
     train_images: &[Array3<f32>],
-    train_labels: &[f64],
+    train_dcp_labels: &[f64],
+    train_clahe_labels: &[f64],
+    train_brightness_labels: &[f64],
 ) -> HazeCNN<AutodiffCnnBackend> {
     println!("\n=== CNN Demo Mode ===");
-    println!("Training on {} images for quick demonstration on CPU-only devices (currently used for development)", train_images.len());
-    println!("Note: CPU training is slow. For production, testing, and further development, will use GPU backend.\n");
+    println!("Training on {} images for quick demonstration on CPU-only devices", train_images.len());
+    println!("Note: CPU training is slow. For production, testing, further development use the GPU backend.\n");
 
     run_cnn_training(
         train_images,
-        train_labels,
-        None,               //no separate test set for demo
-        None,
-        5,          //minimal epochs for fast demo (CPU is slow)
-        4,       //batch size unused
-        0.01,   //higher learning rate to converge faster with fewer epochs for CPU-only test
-        None::<&str>,       //no model saving for demo
+        train_dcp_labels,
+        train_clahe_labels,
+        train_brightness_labels,
+        None,            //no separate test set for demo
+        None,            //no separate test set for demo
+        None,            //no separate test set for demo
+        None,            //no separate test set for demo
+        5,        //minimal epochs for fast demo (CPU is slow)
+        4,      //batch size
+        0.01, //higher learning rate for fewer epochs for faster convergence for CPU-only demo
+        None::<&str>,    //no model saving for demo
     )
 }
 
@@ -974,16 +1120,21 @@ Purpose: MUCH faster than CPU training since GPU's are suited to convolutional n
 */
 pub fn run_cnn_training_gpu<P: AsRef<Path>>(
     train_images: &[Array3<f32>],
-    train_labels: &[f64],
+    train_dcp_labels: &[f64],
+    train_clahe_labels: &[f64],
+    train_brightness_labels: &[f64],
     test_images: Option<&[Array3<f32>]>,
-    test_labels: Option<&[f64]>,
+    test_dcp_labels: Option<&[f64]>,
+    test_clahe_labels: Option<&[f64]>,
+    test_brightness_labels: Option<&[f64]>,
     epochs: usize,
     learning_rate: f64,
     save_path: Option<P>,
 ) -> HazeCNN<AutodiffGpuBackend> {
     println!("\n========================================");
     println!("  Iteration 2: CNN Haze Detection");
-    println!("  GPU-Accelerated Training (wgpu)");
+    println!("  GPU-Accelerated Triple-Output Training (wgpu)");
+    println!("  Outputs: DCP haze score + CLAHE contrast deficit + Brightness deficit");
     println!("========================================\n");
     io::stdout().flush().unwrap();
 
@@ -1043,8 +1194,8 @@ pub fn run_cnn_training_gpu<P: AsRef<Path>>(
         let test_img = Array3::<f32>::zeros((64, 64, 3));
         let test_tensor = image_to_tensor::<AutodiffGpuBackend>(&test_img, &device);
         let output = warmup_model.forward(test_tensor);
-        //Force GPU sync by reading scalar value back to CPU
-        let _val: f32 = output.reshape([1]).into_scalar().elem();
+        //Force GPU sync by reading values back to CPU
+        let _vals: Vec<f32> = output.reshape([3]).into_data().to_vec().unwrap();
         println!("    Forward shader warmup complete");
         io::stdout().flush().unwrap();
         //warmup_model and all tensors dropped here — GPU memory clean
@@ -1066,7 +1217,7 @@ pub fn run_cnn_training_gpu<P: AsRef<Path>>(
     println!("  Conv4: {} -> {} channels, stride 2 (H/16 x W/16)", config.conv3_channels, config.conv4_channels);
     println!("  Global Average Pooling -> {} features", config.conv4_channels);
     println!("  FC1: {} -> {}", config.conv4_channels, config.fc1_size);
-    println!("  FC2: {} -> 1 (haze score)", config.fc1_size);
+    println!("  FC2: {} -> 3 (DCP haze score, CLAHE contrast deficit, brightness deficit)", config.fc1_size);
     println!("  Dropout rate: {}", config.dropout_rate);
     println!();
     io::stdout().flush().unwrap();
@@ -1074,31 +1225,43 @@ pub fn run_cnn_training_gpu<P: AsRef<Path>>(
     let trained_model = train_cnn(
         model,
         train_images,
-        train_labels,
+        train_dcp_labels,
+        train_clahe_labels,
+        train_brightness_labels,
         epochs,
         learning_rate,
         16, //batch_size - images of same dimensions are grouped and batched
         &device,
+        25, //gpu_throttle_ms - 25ms sleep between batches so system stays usable
+        1.0, //model_memory_scale - default architecture
     );
 
     //Evaluate on test set if provided (see README.md for instructions on setup, test set should be in same directory as training set)
-    if let (Some(test_imgs), Some(test_lbls)) = (test_images, test_labels) {
+    if let (Some(test_imgs), Some(test_dcp_lbls), Some(test_clahe_lbls), Some(test_bright_lbls))
+        = (test_images, test_dcp_labels, test_clahe_labels, test_brightness_labels) {
         println!("\n=== Evaluating on Test Set ===");
         io::stdout().flush().unwrap();
 
-        let mse = evaluate_cnn(&trained_model, test_imgs, test_lbls, &device);
-        println!("Test set MSE: {:.6} \n", mse);
+        let (dcp_mse, clahe_mse, bright_mse) = evaluate_cnn(&trained_model, test_imgs, test_dcp_lbls, test_clahe_lbls, test_bright_lbls, &device);
+        println!("Test set MSE's: DCP: {:.6}, CLAHE: {:.6}, Brightness: {:.6}\n", dcp_mse, clahe_mse, bright_mse);
 
-        println!("Sample predictions with suggested DCP parameters:");
-        for (i, (img, &label)) in test_imgs.iter().zip(test_lbls.iter()).take(5).enumerate() {
+        println!("Sample triple predictions and parameters:");
+        for (i, (((img, &dcp_lbl), &clahe_lbl), &bright_lbl)) in test_imgs.iter()
+            .zip(test_dcp_lbls.iter())
+            .zip(test_clahe_lbls.iter())
+            .zip(test_bright_lbls.iter())
+            .take(5).enumerate()
+        {
             let (h, w, _) = img.dim();
             if h < 16 || w < 16 { continue; }
-
-            let pred = predict_haze_cnn(&trained_model, img, &device);
-            let (omega, t0, patch, radius, eps) = suggest_dcp_parameters(pred);
-            println!("  Image {}: predicted={:.3}, actual={:.3}", i + 1, pred, label);
-            println!("           -> suggested: omega={}, t0={}, patch={}, radius={}, eps={}",
-                     omega, t0, patch, radius, eps);
+            let (dcp_pred, clahe_pred, bright_pred) = predict_haze_cnn(&trained_model, img, &device);
+            let (omega, t0, patch, radius, eps) = suggest_dcp_parameters(dcp_pred);
+            let (grid_h, grid_w, clip) = suggest_clahe_parameters(clahe_pred);
+            let gamma = suggest_gamma_parameters(bright_pred);
+            println!("  Image {}: DCP pred={:.3}/actual={:.3}  CLAHE pred={:.3}/actual={:.3}  Bright pred={:.3}/actual={:.3}", i + 1, dcp_pred, dcp_lbl, clahe_pred, clahe_lbl, bright_pred, bright_lbl);
+            println!("           -> DCP:   omega={:.3}, t0={:.3}, patch={}, radius={}, eps={:.5}", omega, t0, patch, radius, eps);
+            println!("           -> CLAHE: grid={}x{}, clip_limit={:.2}", grid_h, grid_w, clip);
+            println!("           -> Gamma: {:.3}", gamma);
         }
         io::stdout().flush().unwrap();
     }
@@ -1180,17 +1343,17 @@ mod tests { //AI-GENERATED Unit Tests of helper functions for tensor constructio
         let config = HazeCNNConfig::new();
         let model = config.init::<CnnBackend>(&device);
 
-        //Test with 64x64 image
+        //Test with 64x64 image, note that output is now [1, 3] (DCP average score, CLAHE deficit, brightness deficit)
         let img1 = Array3::<f32>::zeros((64, 64, 3));
         let tensor1 = image_to_tensor::<CnnBackend>(&img1, &device);
         let output1 = model.forward(tensor1);
-        assert_eq!(output1.dims(), [1, 1]);
+        assert_eq!(output1.dims(), [1, 3]);
 
         //Test with 128x96 image (different aspect ratio)
         let img2 = Array3::<f32>::zeros((128, 96, 3));
         let tensor2 = image_to_tensor::<CnnBackend>(&img2, &device);
         let output2 = model.forward(tensor2);
-        assert_eq!(output2.dims(), [1, 1]);
+        assert_eq!(output2.dims(), [1, 3]);
     }
 
     #[test]
@@ -1199,23 +1362,54 @@ mod tests { //AI-GENERATED Unit Tests of helper functions for tensor constructio
         let config = HazeCNNConfig::new();
         let original_model = config.init::<CnnBackend>(&device);
 
-        let test_img = Array3::<f32>::from_elem((64, 64, 3), 0.5); //Build test image
-        let original_prediction = predict_haze_cnn(&original_model, &test_img, &device); //Make original model query
+        let test_img = Array3::<f32>::from_elem((64, 64, 3), 0.5); //Simple and small test image
+        let (orig_dcp, orig_clahe, orig_bright) = predict_haze_cnn(&original_model, &test_img, &device); //Make original model query
 
         let test_path = "test_model_persistence";
-        original_model.save_model(test_path).expect("Failed to save model"); //Save model
+        original_model.save_model(test_path).expect("Failed to save model");
 
-        assert!(Path::new(&format!("{}.mpk", test_path)).exists(), "Model file should exist"); //Check for file path
+        assert!(Path::new(&format!("{}.mpk", test_path)).exists(), "Model file should exist"); //Check for file path of model being created
 
         let loaded_model = HazeCNN::<CnnBackend>::load_model(test_path, &device).expect("Failed to load model"); //Load and query model or throw error
-        let loaded_prediction = predict_haze_cnn(&loaded_model, &test_img, &device);
+        let (loaded_dcp, loaded_clahe, loaded_bright) = predict_haze_cnn(&loaded_model, &test_img, &device);
 
-        assert!( //check that predictions match
-            (original_prediction - loaded_prediction).abs() < 1e-6,
-            "Predictions should match: original={}, loaded={}",
-            original_prediction, loaded_prediction
-        );
+        assert!((orig_dcp - loaded_dcp).abs() < 1e-6, "DCP predictions should match: original={}, loaded={}", orig_dcp, loaded_dcp); //Check for predictions for both matching
+        assert!((orig_clahe - loaded_clahe).abs() < 1e-6, "CLAHE predictions should match: original={}, loaded={}", orig_clahe, loaded_clahe);
+        assert!((orig_bright - loaded_bright).abs() < 1e-6, "Brightness predictions should match: original={}, loaded={}", orig_bright, loaded_bright);
 
-        fs::remove_file(format!("{}.mpk", test_path)).ok(); //Some cleanup to avoid clutter
+        fs::remove_file(format!("{}.mpk", test_path)).ok(); //Cleanup
     }
 }
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+

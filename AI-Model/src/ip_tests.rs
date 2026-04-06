@@ -6,6 +6,7 @@ use image::{DynamicImage, GenericImageView, RgbImage, Rgb};
 use ndarray::Array3;
 use IP_functions::dehaze::{dehaze_default_parameters_test, dehaze_static_test, dehaze_with_params};
 use IP_functions::enhance::{enhance_clahe_default, enhance_clahe};
+use IP_functions::brightness::{brightness_correct_default, brightness_correct};
 
 //convert input image in DynamicImage format to a 3D array of pixel RGB values for DCP. Moved from main.rs
 pub fn image_to_array3(img: &DynamicImage) -> Array3<f32> {
@@ -45,7 +46,7 @@ pub fn array3_to_image(matrix: &Array3<f32>) -> RgbImage {
 pub fn run_all_ip_tests() { //used ai to collate the testing I did manually earlier
     println!("\n========================================");
     println!("  Image Processing Engine Test Suite");
-    println!("  DCP Dehazing + CLAHE Enhancement Manual Testing");
+    println!("  DCP Dehazing + CLAHE Enhancement + Gamma Brightness Manual Testing");
     println!("========================================\n");
 
     //Test images - three test images for manual evaluation
@@ -55,6 +56,8 @@ pub fn run_all_ip_tests() { //used ai to collate the testing I did manually earl
         run_single_image_tests(img_path);
         println!(); //spacing between image tests
         run_clahe_tests(img_path);
+        println!();
+        run_gamma_tests(img_path);
         println!();
     }
 
@@ -265,6 +268,49 @@ pub fn clahe_with_custom_params(img_path: &str, grid_h: usize, grid_w: usize, cl
     let output_img = array3_to_image(&enhanced);
     output_img.save(&output_path).expect("Failed to save");
     println!("Saved enhanced result to {}", output_path);
+}
+
+/// Run gamma brightness correction tests on a single image
+fn run_gamma_tests(img_path: &str) {
+    println!("--- Gamma Brightness Correction Tests: {} ---", img_path);
+
+    let img = match image::open(img_path) {
+        Ok(img) => img,
+        Err(e) => {
+            println!("Failed to open image {}: {}", img_path, e);
+            return;
+        }
+    };
+
+    let img_matrix = image_to_array3(&img);
+    let base_name = img_path.trim_end_matches(".jpg").trim_end_matches(".png");
+
+    //Test 1: Auto-gamma (estimates optimal gamma from image brightness)
+    println!("\n--- Gamma Test 1: Auto-estimated gamma ---");
+    let auto_gamma = IP_functions::gamma::estimate_gamma(&img_matrix);
+    println!("Auto-estimated gamma: {:.3}", auto_gamma);
+
+    let corrected_auto = brightness_correct_default(&img_matrix);
+    let output_auto = format!("output_gamma_auto_{}.jpg", base_name);
+    let output_img = array3_to_image(&corrected_auto);
+    output_img.save(&output_auto).expect("Failed to save");
+    println!("Saved auto-gamma result to {}", output_auto);
+
+    //Test 2: Brighten (gamma = 0.6)
+    println!("\n--- Gamma Test 2: Brighten (gamma=0.6) ---");
+    let corrected_bright = brightness_correct(&img_matrix, 0.6);
+    let output_bright = format!("output_gamma_bright_{}.jpg", base_name);
+    let output_img = array3_to_image(&corrected_bright);
+    output_img.save(&output_bright).expect("Failed to save");
+    println!("Saved brightened result to {}", output_bright);
+
+    //Test 3: Darken (gamma = 1.5)
+    println!("\n--- Gamma Test 3: Darken (gamma=1.5) ---");
+    let corrected_dark = brightness_correct(&img_matrix, 1.5);
+    let output_dark = format!("output_gamma_dark_{}.jpg", base_name);
+    let output_img = array3_to_image(&corrected_dark);
+    output_img.save(&output_dark).expect("Failed to save");
+    println!("Saved darkened result to {}", output_dark);
 }
 
 #[cfg(test)]
