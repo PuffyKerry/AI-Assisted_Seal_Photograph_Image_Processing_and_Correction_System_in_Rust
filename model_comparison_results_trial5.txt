@@ -18,6 +18,12 @@ Loaded 1650 images successfully.
 
 Computing ground-truth labels (DCP robust, CLAHE deficit, brightness deficit)...
 Running inference on 1650 images...
+  Regressor: 100/1650
+  Regressor: 200/1650
+  Regressor: 300/1650
+  Regressor: 400/1650
+  ...
+  Regressor: 1600/1650
   Regressor: 1650/1650
   Regressor inference successful.
 
