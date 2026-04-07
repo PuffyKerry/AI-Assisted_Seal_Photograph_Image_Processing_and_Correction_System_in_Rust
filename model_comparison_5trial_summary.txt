@@ -1,0 +1,89 @@
+================================================================================
+  MODEL COMPARISON: 5-TRIAL SUMMARY
+  CNN (GPU, Triple-Output) vs Linear Regression (Single-Output)
+  1650 query images per trial, RTX 3070
+================================================================================
+
+Accuracy metrics are DETERMINISTIC — identical across all 5 trials.
+Only inference speed varies (due to OS scheduling, GPU thermals, etc.).
+
+--- DCP Haze Score (both models predict this) ---
+                                          MSE            MAE
+  Linear Regression                    0.006680       0.067610
+  CNN (GPU)                            0.004557       0.052556
+  CNN improvement:  31.8% lower MSE,  22.3% lower MAE
+
+--- CLAHE Contrast Deficit (CNN only) ---
+                                          MSE            MAE
+  CNN (GPU)                            0.015598       0.098816
+  Linear Regression                    N/A (single-output model)
+
+--- Brightness Deficit (CNN only) ---
+                                          MSE            MAE
+  CNN (GPU)                            0.071277       0.237994
+  Linear Regression                    N/A (single-output model)
+
+--- Inference Speed (5 trials) ---
+
+  Linear Regression (ms/image):
+    Trial 1:  40.91
+    Trial 2:  43.17
+    Trial 3:  44.74
+    Trial 4:  43.75
+    Trial 5:  43.33
+    Mean:     43.18 ± 1.41 ms/image
+
+  CNN GPU (ms/image):
+    Trial 1:  228.69
+    Trial 2:  258.93
+    Trial 3:  230.91
+    Trial 4:  227.64
+    Trial 5:  229.85
+    Mean:     235.20 ± 13.32 ms/image
+
+  Speed ratio: CNN is ~5.4x slower than linear regression
+
+--- Total Inference Time (5 trials) ---
+
+  Linear Regression (seconds):
+    Trial 1:   67.50
+    Trial 2:   71.23
+    Trial 3:   73.83
+    Trial 4:   72.19
+    Trial 5:   71.50
+    Mean:      71.25 ± 2.33 s
+
+  CNN GPU (seconds):
+    Trial 1:  377.34
+    Trial 2:  427.23
+    Trial 3:  381.00
+    Trial 4:  375.61
+    Trial 5:  379.25
+    Mean:     388.09 ± 21.98 s
+
+================================================================================
+  CONCLUSIONS
+================================================================================
+
+1. ACCURACY: CNN achieves 31.8% lower DCP MSE and 22.3% lower DCP MAE than
+   linear regression on the same 1650 query images.
+
+2. MULTI-OUTPUT: CNN additionally predicts CLAHE contrast deficit (MSE 0.0156)
+   and brightness deficit (MSE 0.0713), enabling the full DCP → CLAHE → Gamma
+   pipeline. The linear regression model can only predict DCP haze score.
+
+3. SPEED: Linear regression is ~5.4x faster (43.18 ms/image vs 235.20 ms/image).
+   Both models include the full feature extraction pipeline (DCP computation for
+   ground truth labels). The CNN's overhead is due to GPU inference with image
+   tiling for large images.
+
+4. REPRODUCIBILITY: All accuracy metrics are perfectly reproducible across trials.
+   Speed variance is small (LR: ±1.41ms, CNN: ±13.32ms) with Trial 2 being an
+   outlier for CNN (258.93ms vs ~229ms for other trials, likely due to
+   background OS activity or GPU thermal throttling).
+
+5. TRADE-OFF: The CNN is the clear choice for quality — it's more accurate on
+   the shared DCP task AND provides two additional correction capabilities.
+   The ~5x speed penalty (235ms vs 43ms per image) is acceptable for a
+   batch processing pipeline where quality matters more than throughput.
+

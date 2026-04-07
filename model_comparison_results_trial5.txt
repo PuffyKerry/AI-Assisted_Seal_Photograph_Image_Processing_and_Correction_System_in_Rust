@@ -1,0 +1,122 @@
+=== AI-Assisted Seal Photograph Image Processing System ===
+=== Model Comparison: Linear Regression vs CNN ===
+
+Loading linear regression model from: haze_model.json
+  Regressor loaded. Weights: [0.11034306021087716, 0.0072043109016832136, 0.06772115246200029, 0.11364664595649238, 0.09818149445857918], shape=[5], strides=[1], layout=CFcf (0xf), const ndim=1, Bias: 0.1199
+Loading CNN model from: CNN_GPU_TILED.mpk.mpk
+Model loaded from: CNN_GPU_TILED.mpk.mpk
+  CNN loaded on GPU.
+
+Found 1650 query images. Loading in parallel...
+Loaded 5/1650 images...
+Loaded 10/1650 images...
+Loaded 15/1650 images...
+Loaded 20/1650 images...
+...
+Loaded 1650/1650 images...
+Loaded 1650 images successfully.
+
+Computing ground-truth labels (DCP robust, CLAHE deficit, brightness deficit)...
+Running inference on 1650 images...
+  Regressor: 1650/1650
+  Regressor inference successful.
+
+  CNN:       100/1650
+  CNN:       200/1650
+  CNN:       300/1650
+  CNN:       400/1650
+  ...
+  CNN:       1600/1650
+  CNN:       1650/1650
+  CNN inference successful.
+
+========================================================================
+  MODEL COMPARISON RESULTS  (1650 query images)
+========================================================================
+
+--- DCP Haze Score (both models predict this) ---
+                                    MSE         MAE
+          Linear Regression    0.006680    0.067610
+                  CNN (GPU)    0.004557    0.052556
+
+--- CLAHE Contrast Deficit (CNN only) ---
+                                    MSE         MAE
+                  CNN (GPU)    0.015598    0.098816
+          Linear Regression  N/A (single-output model)
+
+--- Brightness Deficit (CNN only) ---
+                                    MSE         MAE
+                  CNN (GPU)    0.071277    0.237994
+          Linear Regression  N/A (single-output model)
+
+--- Inference Speed ---
+          Linear Regression  71.50s total  (43.33ms/image)
+                  CNN (GPU)  379.25s total  (229.85ms/image)
+
+========================================================================
+  SAMPLE IMAGE PROCESSING (first 5 query images)
+========================================================================
+
+── Image 1: aadqxb ──
+  Ground truth:  DCP=0.1680  CLAHE=0.8721  Bright=0.0000
+  Regressor:     DCP=0.2734
+    DCP params:  omega=0.85 t0=0.15 patch=15 radius=60 eps=0.0001
+    Saved: aadqxb_full_regressor.jpg
+  CNN:           DCP=0.1959  CLAHE=0.8704  Bright=0.1417
+    DCP params:  omega=0.81 t0=0.17 patch=15 radius=12 eps=0.0008
+    CLAHE:       grid=8x8 clip=2.31
+    Gamma:       0.950
+    Saved: aadqxb_full_cnn_gpu_tiled.jpg
+
+── Image 2: aayvnn ──
+  Ground truth:  DCP=0.2526  CLAHE=0.7068  Bright=0.0000
+  Regressor:     DCP=0.2951
+    DCP params:  omega=0.85 t0=0.15 patch=15 radius=60 eps=0.0001
+    Saved: aayvnn_full_regressor.jpg
+  CNN:           DCP=0.2729  CLAHE=0.8030  Bright=0.2550
+    DCP params:  omega=0.80 t0=0.18 patch=15 radius=13 eps=0.0008
+    CLAHE:       grid=8x8 clip=2.20
+    Gamma:       0.911
+    Saved: aayvnn_full_cnn_gpu_tiled.jpg
+
+── Image 3: abecjl ──
+  Ground truth:  DCP=0.2530  CLAHE=0.8402  Bright=0.0000
+  Regressor:     DCP=0.3203
+    DCP params:  omega=0.85 t0=0.15 patch=15 radius=60 eps=0.0001
+    Saved: abecjl_full_regressor.jpg
+  CNN:           DCP=0.2467  CLAHE=0.8088  Bright=0.2890
+    DCP params:  omega=0.80 t0=0.17 patch=15 radius=12 eps=0.0008
+    CLAHE:       grid=8x8 clip=2.21
+    Gamma:       0.899
+    Saved: abecjl_full_cnn_gpu_tiled.jpg
+
+── Image 4: abejsg ──
+  Ground truth:  DCP=0.2642  CLAHE=0.6859  Bright=0.3863
+  Regressor:     DCP=0.3165
+    DCP params:  omega=0.85 t0=0.15 patch=15 radius=60 eps=0.0001
+    Saved: abejsg_full_regressor.jpg
+  CNN:           DCP=0.2216  CLAHE=0.8508  Bright=0.1658
+    DCP params:  omega=0.81 t0=0.17 patch=15 radius=12 eps=0.0008
+    CLAHE:       grid=8x8 clip=2.28
+    Gamma:       0.942
+    Saved: abejsg_full_cnn_gpu_tiled.jpg
+
+── Image 5: abnqwb ──
+  Ground truth:  DCP=0.1616  CLAHE=0.5324  Bright=0.9837
+  Regressor:     DCP=0.2006
+    DCP params:  omega=0.85 t0=0.15 patch=15 radius=60 eps=0.0001
+    Saved: abnqwb_full_regressor.jpg
+  CNN:           DCP=0.2213  CLAHE=0.7592  Bright=0.5201
+    DCP params:  omega=0.81 t0=0.17 patch=15 radius=12 eps=0.0008
+    CLAHE:       grid=8x8 clip=2.14
+    Gamma:       0.818
+    Saved: abnqwb_full_cnn_gpu_tiled.jpg
+
+========================================================================
+  COMPARISON COMPLETE
+========================================================================
+
+Summary:
+  CNN achieves 31.8% lower DCP MSE than linear regression.
+  CNN additionally predicts CLAHE deficit (MSE 0.015598) and brightness deficit (MSE 0.071277).
+  Linear regression: 43.33ms/image,  CNN (GPU): 229.85ms/image

@@ -1,0 +1,81 @@
+================================================================================
+  SEALID DATASET STATISTICS
+  Generated: 2026-04-06
+  Source: SealID dataset (Nepovinnykh et al., 2022)
+================================================================================
+
+--- source_database (Training) ---
+  Image count:      430
+  Total size:       273.5 MB
+  Unique dims:      118 distinct (W x H) combinations
+
+  Resolution (pixels):
+    Min:    765 x 479  (0.37 MP)
+    Max:    4096 x 4096  (16.78 MP)
+    Mean:   2803 x 2381  (7.87 MP)
+    Median: 2560 x 1920  (4.92 MP)
+
+  Resolution distribution:
+    < 0.1 MP (tiny):        0  (0%)
+    0.1 - 0.5 MP (small):   3  (0.7%)
+    0.5 - 1.0 MP (medium):  5  (1.2%)
+    1.0 - 2.0 MP (large):   46  (10.7%)
+    > 2.0 MP (x-large):     376  (87.4%)
+
+  Orientation:
+    Landscape: 291  (67.7%)
+    Portrait:  1  (0.2%)
+    Square:    138  (32.1%)
+
+  Top 5 most common resolutions:
+    4096x4096:  138 images
+    2560x1920:  107 images
+    2048x1536:  24 images
+    2000x1400:  23 images
+    2800x2000:  15 images
+
+--- source_query (Evaluation) ---
+  Image count:      1650
+  Total size:       1109.8 MB
+  Unique dims:      272 distinct (W x H) combinations
+
+  Resolution (pixels):
+    Min:    425 x 312  (0.15 MP)
+    Max:    4096 x 4096  (16.78 MP)
+    Mean:   2776 x 2246  (7.01 MP)
+    Median: 2560 x 1920  (4.92 MP)
+
+  Resolution distribution:
+    < 0.1 MP (tiny):        0  (0%)
+    0.1 - 0.5 MP (small):   10  (0.6%)
+    0.5 - 1.0 MP (medium):  17  (1%)
+    1.0 - 2.0 MP (large):   120  (7.3%)
+    > 2.0 MP (x-large):     1503  (91.1%)
+
+  Orientation:
+    Landscape: 1344  (81.5%)
+    Portrait:  3  (0.2%)
+    Square:    303  (18.4%)
+
+  Top 5 most common resolutions:
+    2560x1920:  770 images
+    4096x4096:  303 images
+    3264x2448:  113 images
+    4032x3024:  66 images
+    2000x1400:  39 images
+
+--- After 1/4 Downsample (as loaded for CNN training) ---
+  Downsampled resolution range:
+    Min:    9.2K pixels
+    Max:    1048.6K pixels
+    Mean:   449.5K pixels
+    Median: 307.2K pixels
+  Images > 400K pixels (tiled during training): 630
+
+--- Combined ---
+  Total images across both sets: 2080
+
+  Note: The CNN training uses source_database for training and
+  source_query for evaluation/model comparison (all 5 trials).
+  Images are downsampled to 1/4 resolution during loading
+  (load_images_parallel) for memory efficiency.

@@ -1,0 +1,68 @@
+=== AI-Assisted Seal Photograph Image Processing System ===
+
+Usage: cargo run -p ai-model -- [OPTION]
+
+Options:
+  (no args)      Run ML training demo on test images
+  --demo         Same as no args - ML training demo
+  --ip-tests     Run IP engine tests (dehazing on fog, bansui, achuge)
+  --train-full-demo
+                 Train linear regression on full SealID dataset
+  --train-save MODEL_PATH
+                 Train on demo images and save model to file
+  --train-full-save MODEL_PATH
+                 Train on full SealID dataset and save model to file
+  --process MODEL_PATH INPUT_IMAGE OUTPUT_IMAGE
+                 Load saved model and dehaze an image
+  --train-cnn    Train CNN on full SealID dataset (CPU - slow)
+  --train-cnn-gpu
+                 Train CNN on full SealID dataset (GPU - FAST, use only for devices with dedicated GPUs (graphics cards))
+  --train-cnn-gpu-save MODEL_PATH [EPOCHS]
+                 Train CNN on GPU and save model for later inference (default 50 epochs)
+  --process-cnn-gpu MODEL_PATH INPUT_IMAGE OUTPUT_IMAGE
+                 Load saved CNN model and process image with DCP + CLAHE + Gamma (GPU)
+                 Outputs: OUTPUT_dcp.jpg, OUTPUT.jpg (DCP+CLAHE+Gamma), OUTPUT_clahe.jpg
+  --demo-cnn     CNN training demo on test images with DCP + CLAHE + Gamma (Iteration 2)
+  --compare-models REGRESSOR_PATH CNN_PATH
+                 Compare regressor vs CNN on the full source_query dataset
+  --epoch-study  Train CNN at 10, 30, 50 epochs and compare convergence vs regressor
+                 (Each training run is a separate process. Skips epochs with existing models.)
+  --epoch-comparison REGRESSOR_PATH CNN_PATH1 CNN_PATH2 ...
+                 Compare pre-trained CNN models at different epochs vs regressor (no retraining)
+  --dehaze FILE  Dehaze a specific image file with default parameters
+  --dehaze-custom FILE omega t0 patch_size guided_radius guided_eps
+                 Dehaze with custom DCP parameters
+  --clahe FILE   Enhance contrast of an image with CLAHE (default parameters)
+  --clahe-custom FILE grid_h grid_w clip_limit
+                 Enhance contrast with custom CLAHE parameters
+  --gamma FILE   Correct brightness with auto-estimated gamma
+  --gamma-custom FILE gamma_value
+                 Correct brightness with custom gamma (< 1.0 brightens, > 1.0 darkens)
+  --help, -h     Show this help message
+
+Model Persistence:
+  Train and save: cargo run -p ai-model -- --train-save haze_model.json
+  Process image:  cargo run -p ai-model -- --process haze_model.json foggy.jpg clear.jpg
+
+Custom Dehazing Parameters:
+  omega          Haze retention factor [0-1], lower = more dehaze (default: 0.95)
+  t0             Min transmission [0-1], higher = less noise (default: 0.1)
+  patch_size     Dark channel patch size in pixels (default: 15)
+  guided_radius  Guided filter radius, larger = smoother (default: 60)
+  guided_eps     Guided filter epsilon, smaller = sharper (default: 0.0001)
+
+CLAHE Parameters:
+  grid_h         Number of tile rows (default: 8, more = more local contrast)
+  grid_w         Number of tile columns (default: 8)
+  clip_limit     Contrast limit multiplier (default: 2.5, range 1.5-4.0)
+
+Gamma/Brightness Parameters:
+  gamma          Power-law exponent (< 1.0 brightens, > 1.0 darkens, 1.0 = no change)
+                 Auto mode estimates optimal gamma from image mean luminance
+
+Example:
+  cargo run -p ai-model -- --dehaze-custom image.jpg 0.75 0.25 15 15 0.0001
+
+Dataset Setup:
+  Download SealID from: https://etsin.fairdata.fi/dataset/22b5191e-f24b-4457-93d3-95797c900fc0
+  Extract to: dataset/SealID/full images/source_database/

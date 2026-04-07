@@ -32,9 +32,24 @@ fog-*.jpg
 !web_server/**/*.json
 *.mpk
 
-# Build/training/debug logs
+# Build/training/debug logs (default: ignore all .txt)
 *.txt
 !README.md
 
+# Whitelist experimental results & thesis context files
+!model_comparison_results_trial*.txt
+!model_comparison_5trial_summary.txt
+!convergence_data.txt
+!dataset_statistics.txt
+!ablation_study*.txt
+!epoch_study_output.txt
+!help_out.txt
+!small_only_gpu_cnn_train_terminal_output.txt
+
+# Copilot chat logs — keep LOCAL only, never push
+copilot_2-24.txt
+copilot_chat_*.md
+
 # Temp files
 git_*_temp.txt
+
