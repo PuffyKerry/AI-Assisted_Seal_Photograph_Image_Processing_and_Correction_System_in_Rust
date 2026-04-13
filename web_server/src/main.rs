@@ -280,6 +280,12 @@ fn main() -> std::io::Result<()> {
     println!("  Thread pool:  {} workers, queue {}", thread_count, queue_size);
     println!("  CPU cores:    {}", cores);
     println!();
+
+    // Eagerly load the CNN model so the user sees status at startup
+    print!("  CNN model:    ");
+    handlers::init_cnn_model();
+    println!();
+
     println!("  Endpoints:");
     println!("    GET  /             → Interactive upload UI");
     println!("    GET  /api/health   → Health check");

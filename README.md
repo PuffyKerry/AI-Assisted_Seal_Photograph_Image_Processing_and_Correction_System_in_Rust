@@ -441,7 +441,7 @@ project_root/
   - **Full processing pipeline:** DCP → CLAHE → Gamma with attenuated stacking. CNN-suggested parameters for each stage.
   - **Training Results:** ~0.002 MSE on training set, ~0.003 MSE on test set, ~2.7 hours for 50 epochs on RTX 3070
   - **Model Comparison:** `--compare-models` computes MSE/MAE for regressor vs CNN on the full query dataset, including inference speed and visual sample outputs
-  - **Ablation Study:** `--ablation` evaluates Small/Medium/Large CNN variants as separate child processes, producing a comparison table for data-driven architecture selection
+  - **Ablation Study:** (current non-functional) `--ablation` evaluates Small/Medium/Large CNN variants as separate child processes, producing a comparison table for data-driven architecture selection
   - STATUS: Working. GPU training stable. Images >400K pixels are automatically tiled. Web server integration complete.
   - TODO: 
     - SIGNIFICANT TESTING

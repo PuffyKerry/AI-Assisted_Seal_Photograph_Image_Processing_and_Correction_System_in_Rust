@@ -9,9 +9,13 @@ path = "src/main.rs"
 
 [dependencies]
 IP_functions = { path = "../IP_functions" }
+ai-model = { path = "../AI-Model" }
 image = "0.25.9"
 ndarray = "0.17.1"
 base64 = "0.22"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
+# burn (ndarray backend only) — needed for CNN inference types (device, backend)
+burn = { version = "0.20.1", features = ["ndarray"] }
+
 

@@ -6104,7 +6104,9 @@ name = "web_server"
 version = "0.1.0"
 dependencies = [
  "IP_functions",
+ "ai-model",
  "base64",
+ "burn",
  "image",
  "ndarray 0.17.2",
  "serde",

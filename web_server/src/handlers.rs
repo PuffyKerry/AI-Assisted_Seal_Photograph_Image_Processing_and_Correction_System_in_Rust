@@ -13,6 +13,15 @@
 //   { "image": "<base64-encoded image>", ...optional params... }
 // And return JSON:
 //   { "image": "<base64-encoded result>", "width": N, "height": N, ... }
+//
+// === CNN Integration (Iteration 2) ===
+// When the pre-trained CNN model (CNN_GPU_TILED.mpk) is found at startup,
+// each image is run through the CNN to predict:
+//   - DCP haze score        → drives omega, t0, guided_radius, guided_eps
+//   - CLAHE contrast deficit → drives grid size and clip_limit
+//   - Brightness deficit    → drives gamma value
+// User-supplied parameters always override the CNN suggestions.
+// If the model file is missing, falls back to hard-coded defaults (same as before).
 // =============================================================================
 
 use crate::request::Request;
@@ -22,6 +31,78 @@ use crate::convert;
 use IP_functions::dehaze::dehaze_with_params;
 use IP_functions::enhance::enhance_clahe;
 use IP_functions::brightness::brightness_correct;
+
+// --- CNN inference imports ---
+use ai_model::iteration_2_CNN::{
+    self,
+    HazeCNN, CnnBackend,
+    load_pretrained_model,
+    predict_haze_cnn,
+    suggest_dcp_parameters,
+    suggest_clahe_parameters,
+    suggest_gamma_parameters,
+};
+use burn::backend::ndarray::NdArrayDevice;
+use std::sync::OnceLock;
+
+// =============================================================================
+// Global CNN model — loaded once on first request, shared across all threads
+// =============================================================================
+struct CnnInference {
+    model: HazeCNN<CnnBackend>,
+    device: NdArrayDevice,
+}
+
+// SAFETY: NdArray<f32> is a pure-CPU backend; the model contains only heap-allocated
+// ndarray data which is Send + Sync.  We wrap in OnceLock for lazy one-shot init.
+unsafe impl Send for CnnInference {}
+unsafe impl Sync for CnnInference {}
+
+/// Lazy-loaded global CNN model.  Returns `Some` if the model was found and loaded,
+/// `None` if it couldn't be loaded (missing file, corrupt, etc.) — in which case
+/// the handlers fall back to hard-coded default parameters.
+static CNN_MODEL: OnceLock<Option<CnnInference>> = OnceLock::new();
+
+fn get_cnn() -> Option<&'static CnnInference> {
+    CNN_MODEL.get_or_init(|| {
+        // Try several common paths for the saved model (workspace root, cwd, etc.)
+        let candidates = [
+            "CNN_GPU_TILED",
+            "../CNN_GPU_TILED",
+            "./CNN_GPU_TILED",
+        ];
+        for path in &candidates {
+            if std::path::Path::new(&format!("{}.mpk", path)).exists() {
+                match load_pretrained_model(path) {
+                    Ok(model) => {
+                        println!("  🧠 CNN model loaded from {}.mpk — ML-driven parameter estimation active!", path);
+                        return Some(CnnInference {
+                            model,
+                            device: NdArrayDevice::Cpu,
+                        });
+                    }
+                    Err(e) => {
+                        eprintln!("  ⚠️  Found {}.mpk but failed to load: {}", path, e);
+                    }
+                }
+            }
+        }
+        eprintln!("  ⚠️  CNN model not found (looked for CNN_GPU_TILED.mpk) — using hard-coded defaults");
+        None
+    }).as_ref()
+}
+
+/// Run CNN inference on an image, returning (dcp_score, clahe_score, brightness_score).
+/// Returns None if the model isn't loaded.
+fn cnn_predict(img: &ndarray::Array3<f32>) -> Option<(f32, f32, f32)> {
+    let cnn = get_cnn()?;
+    Some(predict_haze_cnn(&cnn.model, img, &cnn.device))
+}
+
+/// Eagerly initialise the CNN model at startup (called from main).
+pub fn init_cnn_model() {
+    let _ = get_cnn(); // triggers OnceLock init + prints status
+}
 
 // ---------------------------------------------------------------------------
 // Helper: extract a JSON string field (simple parser, no serde needed for this)
@@ -81,17 +162,21 @@ pub fn home_handler(_request: &Request) -> Response {
 }
 
 // ===========================================================================
-// GET /api/health — Health check
+// GET /api/health — Health check (includes CNN model status)
 // ===========================================================================
 pub fn health_handler(_request: &Request) -> Response {
-    Response::ok()
-        .json(r#"{"status":"ok","service":"seal-ip-server","version":"0.1.0","endpoints":["/api/dehaze","/api/clahe","/api/gamma","/api/process"]}"#.to_string())
-        .build()
+    let cnn_loaded = get_cnn().is_some();
+    let json = format!(
+        r#"{{"status":"ok","service":"seal-ip-server","version":"0.2.0","cnn_model_loaded":{},"endpoints":["/api/dehaze","/api/clahe","/api/gamma","/api/process"]}}"#,
+        cnn_loaded
+    );
+    Response::ok().json(json).build()
 }
 
 // ===========================================================================
 // POST /api/dehaze — Dark Channel Prior dehazing
 // Optional params: patch_size, omega, t0, top_percent, guided_radius, guided_eps
+// If no custom params → CNN predicts optimal values per-image.
 // ===========================================================================
 pub fn dehaze_handler(request: &Request) -> Response {
     let body = request.body_as_string();
@@ -107,28 +192,34 @@ pub fn dehaze_handler(request: &Request) -> Response {
     let (h, w, _) = img_array.dim();
     println!("[API] /api/dehaze — image {}x{}", w, h);
 
-    // Extract optional custom parameters or use defaults
-    let omega = extract_json_f32(&body, "omega").unwrap_or(0.75);
-    let t0 = extract_json_f32(&body, "t0").unwrap_or(0.25);
-    let patch_size = extract_json_usize(&body, "patch_size").unwrap_or(15);
-    let top_percent = extract_json_f32(&body, "top_percent").unwrap_or(0.001);
-    let guided_radius = extract_json_usize(&body, "guided_radius").unwrap_or(15);
-    let guided_eps = extract_json_f32(&body, "guided_eps").unwrap_or(0.0001);
+    // --- CNN-driven defaults (or hard-coded fallback) ---
+    let preds = cnn_predict(&img_array);
+    let (def_omega, def_t0, def_patch, def_radius, def_eps) = preds
+        .map(|(dcp, _, _)| {
+            println!("  CNN haze score: {:.4}", dcp);
+            suggest_dcp_parameters(dcp)
+        })
+        .unwrap_or((0.75, 0.25, 15, 15, 0.0001));
 
-    let has_custom = extract_json_f32(&body, "omega").is_some();
-    if has_custom {
-        println!("  Custom params: omega={}, t0={}, patch={}, grad_r={}, grad_e={}",
-                 omega, t0, patch_size, guided_radius, guided_eps);
-    } else {
-        println!("  Using default parameters");
-    }
+    let omega = extract_json_f32(&body, "omega").unwrap_or(def_omega);
+    let t0 = extract_json_f32(&body, "t0").unwrap_or(def_t0);
+    let patch_size = extract_json_usize(&body, "patch_size").unwrap_or(def_patch);
+    let top_percent = extract_json_f32(&body, "top_percent").unwrap_or(0.001);
+    let guided_radius = extract_json_usize(&body, "guided_radius").unwrap_or(def_radius);
+    let guided_eps = extract_json_f32(&body, "guided_eps").unwrap_or(def_eps);
+
+    let using_cnn = preds.is_some() && extract_json_f32(&body, "omega").is_none();
+    println!("  Params ({}): omega={:.3}, t0={:.3}, patch={}, grad_r={}, grad_e={:.5}",
+             if using_cnn { "CNN" } else if extract_json_f32(&body, "omega").is_some() { "custom" } else { "default" },
+             omega, t0, patch_size, guided_radius, guided_eps);
+
     let result = dehaze_with_params(&img_array, patch_size, omega, t0, top_percent, guided_radius, guided_eps);
 
     match convert::encode_image_base64_jpeg(&result) {
         Ok(b64) => {
             let json = format!(
-                r#"{{"image":"{}","width":{},"height":{},"operation":"dehaze","params":{{"omega":{},"t0":{},"patch_size":{},"top_percent":{},"guided_radius":{},"guided_eps":{}}}}}"#,
-                b64, w, h, omega, t0, patch_size, top_percent, guided_radius, guided_eps
+                r#"{{"image":"{}","width":{},"height":{},"operation":"dehaze","ml_driven":{},"params":{{"omega":{},"t0":{},"patch_size":{},"top_percent":{},"guided_radius":{},"guided_eps":{}}}}}"#,
+                b64, w, h, using_cnn, omega, t0, patch_size, top_percent, guided_radius, guided_eps
             );
             Response::ok().json(json).build()
         }
@@ -141,6 +232,7 @@ pub fn dehaze_handler(request: &Request) -> Response {
 // ===========================================================================
 // POST /api/clahe — CLAHE contrast enhancement
 // Optional params: grid_h, grid_w, clip_limit
+// If no custom params → CNN predicts optimal values per-image.
 // ===========================================================================
 pub fn clahe_handler(request: &Request) -> Response {
     let body = request.body_as_string();
@@ -156,22 +248,31 @@ pub fn clahe_handler(request: &Request) -> Response {
     let (h, w, _) = img_array.dim();
     println!("[API] /api/clahe — image {}x{}", w, h);
 
-    let grid_h = extract_json_usize(&body, "grid_h").unwrap_or(8);
-    let grid_w = extract_json_usize(&body, "grid_w").unwrap_or(8);
-    let clip_limit = extract_json_f32(&body, "clip_limit").unwrap_or(2.0);
+    // --- CNN-driven defaults (or hard-coded fallback) ---
+    let preds = cnn_predict(&img_array);
+    let (def_grid_h, def_grid_w, def_clip) = preds
+        .map(|(_, clahe, _)| {
+            println!("  CNN contrast deficit: {:.4}", clahe);
+            suggest_clahe_parameters(clahe)
+        })
+        .unwrap_or((8, 8, 2.0));
 
-    if extract_json_f32(&body, "clip_limit").is_some() {
-        println!("  Custom params: grid={}x{}, clip_limit={}", grid_h, grid_w, clip_limit);
-    } else {
-        println!("  Using default parameters (8x8, clip=2.0)");
-    }
+    let grid_h = extract_json_usize(&body, "grid_h").unwrap_or(def_grid_h);
+    let grid_w = extract_json_usize(&body, "grid_w").unwrap_or(def_grid_w);
+    let clip_limit = extract_json_f32(&body, "clip_limit").unwrap_or(def_clip);
+
+    let using_cnn = preds.is_some() && extract_json_f32(&body, "clip_limit").is_none();
+    println!("  Params ({}): grid={}x{}, clip_limit={:.2}",
+             if using_cnn { "CNN" } else if extract_json_f32(&body, "clip_limit").is_some() { "custom" } else { "default" },
+             grid_h, grid_w, clip_limit);
+
     let result = enhance_clahe(&img_array, grid_h, grid_w, clip_limit);
 
     match convert::encode_image_base64_jpeg(&result) {
         Ok(b64) => {
             let json = format!(
-                r#"{{"image":"{}","width":{},"height":{},"operation":"clahe","params":{{"grid_h":{},"grid_w":{},"clip_limit":{}}}}}"#,
-                b64, w, h, grid_h, grid_w, clip_limit
+                r#"{{"image":"{}","width":{},"height":{},"operation":"clahe","ml_driven":{},"params":{{"grid_h":{},"grid_w":{},"clip_limit":{}}}}}"#,
+                b64, w, h, using_cnn, grid_h, grid_w, clip_limit
             );
             Response::ok().json(json).build()
         }
@@ -184,6 +285,7 @@ pub fn clahe_handler(request: &Request) -> Response {
 // ===========================================================================
 // POST /api/gamma — Gamma brightness correction
 // Optional params: gamma (float, <1 brightens, >1 darkens)
+// If no custom gamma → CNN predicts brightness deficit and suggests gamma.
 // ===========================================================================
 pub fn gamma_handler(request: &Request) -> Response {
     let body = request.body_as_string();
@@ -200,21 +302,35 @@ pub fn gamma_handler(request: &Request) -> Response {
     println!("[API] /api/gamma — image {}x{}", w, h);
 
     let custom_gamma = extract_json_f32(&body, "gamma");
+
+    // CNN-driven gamma or heuristic fallback
+    let preds = cnn_predict(&img_array);
     let gamma_val = custom_gamma.unwrap_or_else(|| {
-        IP_functions::gamma::estimate_gamma(&img_array)
+        if let Some((_, _, bright)) = preds {
+            println!("  CNN brightness deficit: {:.4}", bright);
+            suggest_gamma_parameters(bright)
+        } else {
+            // Original heuristic fallback
+            IP_functions::gamma::estimate_gamma(&img_array)
+        }
     });
+
+    let using_cnn = preds.is_some() && custom_gamma.is_none();
     if custom_gamma.is_some() {
-        println!("  Custom gamma: {}", gamma_val);
+        println!("  Custom gamma: {:.3}", gamma_val);
+    } else if using_cnn {
+        println!("  CNN-suggested gamma: {:.3}", gamma_val);
     } else {
-        println!("  Using auto-estimated gamma: {:.3}", gamma_val);
+        println!("  Heuristic auto-estimated gamma: {:.3}", gamma_val);
     }
+
     let result = brightness_correct(&img_array, gamma_val);
 
     match convert::encode_image_base64_jpeg(&result) {
         Ok(b64) => {
             let json = format!(
-                r#"{{"image":"{}","width":{},"height":{},"operation":"gamma","params":{{"gamma":{:.4},"auto_estimated":{}}}}}"#,
-                b64, w, h, gamma_val, custom_gamma.is_none()
+                r#"{{"image":"{}","width":{},"height":{},"operation":"gamma","ml_driven":{},"params":{{"gamma":{:.4},"auto_estimated":{}}}}}"#,
+                b64, w, h, using_cnn, gamma_val, custom_gamma.is_none()
             );
             Response::ok().json(json).build()
         }
@@ -226,8 +342,9 @@ pub fn gamma_handler(request: &Request) -> Response {
 
 // ===========================================================================
 // POST /api/process — Full pipeline: DCP → CLAHE → Gamma
-// Applies all three operations in sequence with attenuated stacking
-// Optional params: same as individual endpoints
+// Applies all three operations in sequence with attenuated stacking.
+// CNN drives ALL default parameters when the model is loaded.
+// Optional params: same as individual endpoints (user overrides CNN suggestions)
 // ===========================================================================
 pub fn process_handler(request: &Request) -> Response {
     let body = request.body_as_string();
@@ -243,36 +360,57 @@ pub fn process_handler(request: &Request) -> Response {
     let (h, w, _) = img_array.dim();
     println!("[API] /api/process — Full pipeline on {}x{}", w, h);
 
-    // === Step 1: DCP Dehazing ===
-    let omega = extract_json_f32(&body, "omega").unwrap_or(0.75);
-    let t0 = extract_json_f32(&body, "t0").unwrap_or(0.25);
-    let patch_size = extract_json_usize(&body, "patch_size").unwrap_or(15);
-    let top_percent = extract_json_f32(&body, "top_percent").unwrap_or(0.001);
-    let guided_radius = extract_json_usize(&body, "guided_radius").unwrap_or(15);
-    let guided_eps = extract_json_f32(&body, "guided_eps").unwrap_or(0.0001);
+    // --- Single CNN inference for all three scores ---
+    let preds = cnn_predict(&img_array);
+    if let Some((dcp, clahe, bright)) = preds {
+        println!("  CNN predictions: DCP={:.4}, CLAHE={:.4}, Bright={:.4}", dcp, clahe, bright);
+    } else {
+        println!("  CNN model not available — using hard-coded defaults");
+    }
 
-    println!("  Step 1: DCP dehaze (omega={}, t0={}, patch={})", omega, t0, patch_size);
+    // === DCP defaults from CNN (or hard-coded) ===
+    let (def_omega, def_t0, def_patch, def_radius, def_eps) = preds
+        .map(|(dcp, _, _)| suggest_dcp_parameters(dcp))
+        .unwrap_or((0.75, 0.25, 15, 15, 0.0001));
+
+    let omega = extract_json_f32(&body, "omega").unwrap_or(def_omega);
+    let t0 = extract_json_f32(&body, "t0").unwrap_or(def_t0);
+    let patch_size = extract_json_usize(&body, "patch_size").unwrap_or(def_patch);
+    let top_percent = extract_json_f32(&body, "top_percent").unwrap_or(0.001);
+    let guided_radius = extract_json_usize(&body, "guided_radius").unwrap_or(def_radius);
+    let guided_eps = extract_json_f32(&body, "guided_eps").unwrap_or(def_eps);
+
+    println!("  Step 1: DCP dehaze (omega={:.3}, t0={:.3}, patch={})", omega, t0, patch_size);
     let dehazed = dehaze_with_params(&img_array, patch_size, omega, t0, top_percent, guided_radius, guided_eps);
 
-    // === Step 2: CLAHE on dehazed result (attenuated) ===
-    let grid_h = extract_json_usize(&body, "grid_h").unwrap_or(8);
-    let grid_w = extract_json_usize(&body, "grid_w").unwrap_or(8);
-    let clip_limit = extract_json_f32(&body, "clip_limit").unwrap_or(2.0);
+    // === CLAHE defaults from CNN (or hard-coded) ===
+    let (def_grid_h, def_grid_w, def_clip) = preds
+        .map(|(_, clahe, _)| suggest_clahe_parameters(clahe))
+        .unwrap_or((8, 8, 2.0));
+
+    let grid_h = extract_json_usize(&body, "grid_h").unwrap_or(def_grid_h);
+    let grid_w = extract_json_usize(&body, "grid_w").unwrap_or(def_grid_w);
+    let clip_limit = extract_json_f32(&body, "clip_limit").unwrap_or(def_clip);
     // Attenuate clip_limit when stacking after DCP to avoid overcorrection
     let stacked_clip = 1.0_f32 + (clip_limit - 1.0) * 0.7;
     println!("  Step 2: CLAHE (grid={}x{}, clip {:.2} → {:.2} stacked)", grid_h, grid_w, clip_limit, stacked_clip);
     let enhanced = enhance_clahe(&dehazed, grid_h, grid_w, stacked_clip);
 
-    // === Step 3: Gamma on DCP+CLAHE result (attenuated) ===
+    // === Gamma defaults from CNN (or heuristic) ===
     let gamma = extract_json_f32(&body, "gamma");
     let gamma_val = gamma.unwrap_or_else(|| {
-        // Auto-estimate from the enhanced result
-        IP_functions::gamma::estimate_gamma(&enhanced)
+        if let Some((_, _, bright)) = preds {
+            suggest_gamma_parameters(bright)
+        } else {
+            IP_functions::gamma::estimate_gamma(&enhanced)
+        }
     });
     // Attenuate gamma toward identity when stacking
     let stacked_gamma = 1.0 + (gamma_val - 1.0) * 0.5;
     println!("  Step 3: Gamma ({:.3} → {:.3} stacked)", gamma_val, stacked_gamma);
     let final_result = brightness_correct(&enhanced, stacked_gamma);
+
+    let ml_driven = preds.is_some();
 
     // Build response with the full pipeline result, plus individual stages as base64
     match convert::encode_image_base64_jpeg(&final_result) {
@@ -280,13 +418,17 @@ pub fn process_handler(request: &Request) -> Response {
             // Also encode individual stages for comparison
             let b64_dehazed = convert::encode_image_base64_jpeg(&dehazed).unwrap_or_default();
             let b64_clahe = convert::encode_image_base64_jpeg(&enhance_clahe(&img_array, grid_h, grid_w, clip_limit)).unwrap_or_default();
-            let gamma_only_val = IP_functions::gamma::estimate_gamma(&img_array);
+            let gamma_only_val = if let Some((_, _, bright)) = preds {
+                suggest_gamma_parameters(bright)
+            } else {
+                IP_functions::gamma::estimate_gamma(&img_array)
+            };
             let b64_gamma = convert::encode_image_base64_jpeg(&brightness_correct(&img_array, gamma_only_val)).unwrap_or_default();
 
             let json = format!(
-                r#"{{"image":"{}","dehaze_only":"{}","clahe_only":"{}","gamma_only":"{}","width":{},"height":{},"operation":"full_pipeline","params":{{"omega":{},"t0":{},"patch_size":{},"top_percent":{},"guided_radius":{},"guided_eps":{},"clip_limit":{},"stacked_clip":{:.3},"gamma":{:.4},"stacked_gamma":{:.4},"grid_h":{},"grid_w":{}}}}}"#,
+                r#"{{"image":"{}","dehaze_only":"{}","clahe_only":"{}","gamma_only":"{}","width":{},"height":{},"operation":"full_pipeline","ml_driven":{},"params":{{"omega":{},"t0":{},"patch_size":{},"top_percent":{},"guided_radius":{},"guided_eps":{},"clip_limit":{},"stacked_clip":{:.3},"gamma":{:.4},"stacked_gamma":{:.4},"grid_h":{},"grid_w":{}}}}}"#,
                 b64_final, b64_dehazed, b64_clahe, b64_gamma,
-                w, h,
+                w, h, ml_driven,
                 omega, t0, patch_size, top_percent, guided_radius, guided_eps,
                 clip_limit, stacked_clip, gamma_val, stacked_gamma, grid_h, grid_w
             );
@@ -496,7 +638,7 @@ const UPLOAD_PAGE_HTML: &str = r#"<!DOCTYPE html>
         }
         .params-used strong { color: #81d4fa; }
         .params-used .param-val { color: #4fc3f7; font-family: 'Consolas', 'Courier New', monospace; }
-        .params-used .default-tag {
+        .default-tag {
             font-size: 0.75em;
             background: rgba(255,183,77,0.18);
             color: #ffb74d;
@@ -508,6 +650,14 @@ const UPLOAD_PAGE_HTML: &str = r#"<!DOCTYPE html>
             font-size: 0.75em;
             background: rgba(102,187,106,0.18);
             color: #66bb6a;
+            padding: 1px 5px;
+            border-radius: 3px;
+            margin-left: 4px;
+        }
+        .params-used .cnn-tag {
+            font-size: 0.75em;
+            background: rgba(79,195,247,0.22);
+            color: #4fc3f7;
             padding: 1px 5px;
             border-radius: 3px;
             margin-left: 4px;
@@ -524,9 +674,10 @@ const UPLOAD_PAGE_HTML: &str = r#"<!DOCTYPE html>
             <summary>About This System</summary>
             <p>
                 This tool corrects common defects in seal &amp; pinniped photographs — haze, low contrast, and poor lighting —
-                using three image processing algorithms that can be run individually or as a combined pipeline.
-                A CNN model trained on the <strong>SealID</strong> dataset (GPU-accelerated, wgpu) provides automatic parameter estimation;
-                you can also set parameters manually.
+                using three image processing algorithms whose parameters are <strong>automatically tuned by a CNN
+                trained on the SealID dataset</strong> (GPU-accelerated, wgpu).
+                When the CNN model is loaded, each uploaded image is analyzed and the optimal DCP, CLAHE,
+                and gamma parameters are predicted per-image.  You can still override any parameter manually.
             </p>
             <ul>
                 <li><strong>DCP Dehaze</strong> — Dark Channel Prior removes atmospheric haze, fog, and mist by estimating a scene transmission map and atmospheric light.</li>
@@ -550,7 +701,7 @@ const UPLOAD_PAGE_HTML: &str = r#"<!DOCTYPE html>
             <img id="previewImg" alt="Preview">
         </div>
 
-        <span class="params-toggle" onclick="toggleParams()">⚙️ Custom Parameters (optional — leave blank for smart defaults)</span>
+        <span class="params-toggle" onclick="toggleParams()">⚙️ Custom Parameters (optional — CNN picks optimal defaults per-image)</span>
         <div class="params-panel" id="paramsPanel">
             <div class="param-group">
                 <!-- DCP params -->
@@ -705,19 +856,21 @@ const UPLOAD_PAGE_HTML: &str = r#"<!DOCTYPE html>
             auto_estimated: 'Auto-estimated'
         };
 
-        function showParamsUsed(params, userKeys) {
+        function showParamsUsed(params, userKeys, mlDriven) {
             if (!params || Object.keys(params).length === 0) {
                 document.getElementById('paramsUsedArea').innerHTML = '';
                 return;
             }
-            let html = '<div class="params-used"><strong>Parameters Used:</strong><br>';
+            let html = '<div class="params-used"><strong>Parameters Used';
+            if (mlDriven) html += ' 🧠 <span class="cnn-tag">CNN-driven</span>';
+            html += ':</strong><br>';
             for (const [k, v] of Object.entries(params)) {
                 if (k === 'auto_estimated') continue;
                 const name = paramMeta[k] || k;
-                const isDefault = !userKeys.has(k);
-                const tag = isDefault
-                    ? '<span class="default-tag">default</span>'
-                    : '<span class="custom-tag">custom</span>';
+                const isUser = userKeys.has(k);
+                const tag = isUser
+                    ? '<span class="custom-tag">custom</span>'
+                    : (mlDriven ? '<span class="cnn-tag">CNN</span>' : '<span class="default-tag">default</span>');
                 const val = (typeof v === 'number') ? (Number.isInteger(v) ? v : v.toFixed(4).replace(/0+$/, '').replace(/\.$/, '')) : v;
                 html += name + ': <span class="param-val">' + val + '</span>' + tag + '&ensp; ';
             }
@@ -748,8 +901,9 @@ const UPLOAD_PAGE_HTML: &str = r#"<!DOCTYPE html>
                     throw new Error(err);
                 }
                 const data = await resp.json();
-                setStatus('Done in ' + elapsed + 's!', 'success');
-                showParamsUsed(data.params || {}, userKeys);
+                const mlTag = data.ml_driven ? ' 🧠 CNN-driven' : '';
+                setStatus('Done in ' + elapsed + 's!' + mlTag, 'success');
+                showParamsUsed(data.params || {}, userKeys, !!data.ml_driven);
                 showResults(data, endpoint);
             } catch (e) {
                 setStatus('Error: ' + e.message, 'error');

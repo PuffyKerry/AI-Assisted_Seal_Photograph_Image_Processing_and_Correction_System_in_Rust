@@ -13,7 +13,10 @@ mod linear_regression;
 mod extraction;
 mod training;
 mod ip_tests;
-mod iteration_2_CNN;  //Iteration 2: CNN-based haze detection
+
+// Iteration 2: CNN-based haze detection — now lives in lib.rs so the web_server crate can
+// also depend on it for inference.  main.rs uses it via the library re-export.
+use ai_model::iteration_2_CNN;
 
 use std::env;
 use std::path::{Path, PathBuf};
